@@ -3,9 +3,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { assembleDiff } from "../../src/git.js";
+import { GrokMcpError } from "../../src/errors.js";
+import {
+  assembleDiff,
+  getDiffVsRef,
+  verifyBaseRef,
+} from "../../src/git.js";
 
 const tmpDirs: string[] = [];
+
+const secretCfg = {
+  secretBasenames: [".env", "auth.json"],
+  aggressive: false,
+};
 
 afterEach(() => {
   for (const d of tmpDirs.splice(0)) {
@@ -66,5 +76,152 @@ describe("assembleDiff", () => {
     expect(result.changedFiles).toContain("ok.ts");
     expect(result.changedFiles).not.toContain(".env");
     expect(result.warnings).toContain("REDACTED_SECRET_PATHS");
+  });
+
+  it("omits tracked .env and auth.json from changed_files and diff", async () => {
+    const repo = initRepo();
+    // Innocuous placeholder values — must not appear in assembleDiff output
+    fs.writeFileSync(path.join(repo, ".env"), "PLACEHOLDER_ENV=innocuous\n");
+    fs.writeFileSync(
+      path.join(repo, "auth.json"),
+      JSON.stringify({ token: "innocuous-token-value" }) + "\n",
+    );
+    fs.writeFileSync(path.join(repo, "app.ts"), "export const n = 1;\n");
+    execFileSync("git", ["add", ".env", "auth.json", "app.ts"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "add secrets and app"], { cwd: repo });
+
+    // Modify tracked files so they show in git diff HEAD
+    fs.writeFileSync(path.join(repo, ".env"), "PLACEHOLDER_ENV=changed-innocuous\n");
+    fs.writeFileSync(
+      path.join(repo, "auth.json"),
+      JSON.stringify({ token: "changed-innocuous-token" }) + "\n",
+    );
+    fs.writeFileSync(path.join(repo, "app.ts"), "export const n = 2;\n");
+
+    const result = await assembleDiff(repo, secretCfg, {
+      maxDiffBytes: 1_000_000,
+      maxUntrackedFileBytes: 500_000,
+    });
+
+    expect(result.changedFiles).toContain("app.ts");
+    expect(result.changedFiles).not.toContain(".env");
+    expect(result.changedFiles).not.toContain("auth.json");
+    expect(result.warnings).toContain("REDACTED_SECRET_PATHS");
+
+    expect(result.diff).toContain("app.ts");
+    expect(result.diff).toContain("export const n = 2");
+    expect(result.diff).not.toContain(".env");
+    expect(result.diff).not.toContain("auth.json");
+    expect(result.diff).not.toContain("PLACEHOLDER_ENV");
+    expect(result.diff).not.toContain("innocuous");
+    expect(result.diff).not.toContain("changed-innocuous");
+  });
+});
+
+describe("getDiffVsRef", () => {
+  it("omits secret paths/content from diff and stat while keeping normal files", async () => {
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, "normal.ts"), "export const a = 1;\n");
+    fs.writeFileSync(path.join(repo, ".env"), "PLACEHOLDER_ENV=base-innocuous\n");
+    fs.writeFileSync(
+      path.join(repo, "auth.json"),
+      JSON.stringify({ token: "base-innocuous-token" }) + "\n",
+    );
+    execFileSync("git", ["add", "normal.ts", ".env", "auth.json"], {
+      cwd: repo,
+    });
+    execFileSync("git", ["commit", "-m", "base with secrets"], { cwd: repo });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repo,
+      encoding: "utf8",
+    }).trim();
+
+    fs.writeFileSync(path.join(repo, "normal.ts"), "export const a = 2;\n");
+    fs.writeFileSync(path.join(repo, ".env"), "PLACEHOLDER_ENV=tip-innocuous\n");
+    fs.writeFileSync(
+      path.join(repo, "auth.json"),
+      JSON.stringify({ token: "tip-innocuous-token" }) + "\n",
+    );
+    fs.writeFileSync(path.join(repo, "extra.ts"), "export const b = 1;\n");
+    execFileSync("git", ["add", "normal.ts", ".env", "auth.json", "extra.ts"], {
+      cwd: repo,
+    });
+    execFileSync("git", ["commit", "-m", "tip changes"], { cwd: repo });
+
+    const result = await getDiffVsRef(repo, baseSha, 1_000_000, secretCfg);
+
+    expect(result.empty).toBe(false);
+    expect(result.diff).toContain("normal.ts");
+    expect(result.diff).toContain("extra.ts");
+    expect(result.diff).toContain("export const a = 2");
+    expect(result.diff).not.toContain(".env");
+    expect(result.diff).not.toContain("auth.json");
+    expect(result.diff).not.toContain("PLACEHOLDER_ENV");
+    expect(result.diff).not.toContain("innocuous");
+    expect(result.diff).not.toContain("tip-innocuous");
+
+    expect(result.stat).toMatch(/normal\.ts|extra\.ts/);
+    expect(result.stat).not.toContain(".env");
+    expect(result.stat).not.toContain("auth.json");
+    expect(result.stat).not.toContain("PLACEHOLDER_ENV");
+  });
+
+  it("rejects base_ref beginning with --", async () => {
+    const repo = initRepo();
+    await expect(
+      getDiffVsRef(repo, "--output=/tmp/x", 1_000_000, secretCfg),
+    ).rejects.toMatchObject({
+      code: "GROK_MCP_INVALID_ARGS",
+    });
+    await expect(
+      getDiffVsRef(repo, "--output=/tmp/x", 1_000_000, secretCfg),
+    ).rejects.toBeInstanceOf(GrokMcpError);
+  });
+
+  it("rejects nonexistent refs", async () => {
+    const repo = initRepo();
+    await expect(
+      getDiffVsRef(repo, "definitely-not-a-real-ref-xyz", 1_000_000, secretCfg),
+    ).rejects.toMatchObject({
+      code: "GROK_MCP_INVALID_ARGS",
+    });
+  });
+});
+
+describe("verifyBaseRef", () => {
+  it("accepts commit-ish refs", async () => {
+    const repo = initRepo();
+    const sha = await verifyBaseRef(repo, "HEAD");
+    expect(sha).toMatch(/^[0-9a-f]{40,}$/i);
+  });
+
+  it("rejects base_ref beginning with --", async () => {
+    const repo = initRepo();
+    await expect(verifyBaseRef(repo, "--all")).rejects.toBeInstanceOf(
+      GrokMcpError,
+    );
+    await expect(verifyBaseRef(repo, "--all")).rejects.toMatchObject({
+      code: "GROK_MCP_INVALID_ARGS",
+      message: expect.stringMatching(/must not start with/i),
+    });
+  });
+
+  it("rejects nonexistent refs", async () => {
+    const repo = initRepo();
+    await expect(
+      verifyBaseRef(repo, "no-such-ref-abc123"),
+    ).rejects.toMatchObject({
+      code: "GROK_MCP_INVALID_ARGS",
+      message: expect.stringMatching(/commit-ish|valid/i),
+    });
+  });
+
+  it("rejects blob/path objects (HEAD:path) — commit-ish only", async () => {
+    const repo = initRepo();
+    // HEAD:README.md resolves as a blob, not a commit
+    await expect(verifyBaseRef(repo, "HEAD:README.md")).rejects.toMatchObject({
+      code: "GROK_MCP_INVALID_ARGS",
+      message: expect.stringMatching(/commit-ish|valid/i),
+    });
   });
 });

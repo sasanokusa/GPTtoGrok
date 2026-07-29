@@ -307,30 +307,22 @@ export function assertSafeBaseRef(baseRef: string): void {
 }
 
 /**
- * Verify base_ref is a commit-ish and return the resolved object name.
+ * Verify base_ref is a commit-ish and return the resolved commit object name.
  * Uses `--end-of-options` so the ref cannot be parsed as a git option.
+ * Rejects non-commit objects (blobs, trees, HEAD:path) — no arbitrary-object fallback.
  */
 export async function verifyBaseRef(cwd: string, baseRef: string): Promise<string> {
   assertSafeBaseRef(baseRef);
-  // Prefer commit-ish; fall back to any object that rev-parse accepts for diff.
   const r = await runGit(
     ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`],
     cwd,
   );
   if (r.exitCode !== 0) {
-    // Some refs (e.g. tree-ish) may not resolve with ^{commit}; try plain verify.
-    const r2 = await runGit(
-      ["rev-parse", "--verify", "--end-of-options", baseRef],
-      cwd,
+    throw new GrokMcpError(
+      "GROK_MCP_INVALID_ARGS",
+      `base_ref is not a valid commit-ish: ${baseRef}`,
+      { stderr_tail: r.stderr.slice(-500) },
     );
-    if (r2.exitCode !== 0) {
-      throw new GrokMcpError(
-        "GROK_MCP_INVALID_ARGS",
-        `base_ref is not a valid revision: ${baseRef}`,
-        { stderr_tail: (r.stderr || r2.stderr).slice(-500) },
-      );
-    }
-    return r2.stdout.trim().split("\n")[0]!.trim();
   }
   return r.stdout.trim().split("\n")[0]!.trim();
 }

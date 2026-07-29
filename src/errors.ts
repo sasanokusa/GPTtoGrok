@@ -91,6 +91,6 @@ export class GrokMcpError extends Error {
   }
 }
 
-export function isGrokMcpError(err: unknown): boolean {
+export function isGrokMcpError(err: unknown): err is GrokMcpError {
   return err instanceof GrokMcpError;
 }
