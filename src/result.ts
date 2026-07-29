@@ -6,7 +6,8 @@ import type {
 import type { ExecutionMode, GrokToolResult, TestsResult } from "./types.js";
 
 export function emptyTests(): TestsResult {
-  return { ran: false };
+  // Unrun tests are not truncated — no output was produced to cut.
+  return { ran: false, output_truncated: false };
 }
 
 /** Response-mode block; identical shape whether or not a diff body is returned. */

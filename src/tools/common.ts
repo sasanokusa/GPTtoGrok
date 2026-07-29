@@ -38,6 +38,10 @@ import {
   type ResponseModeResultFields,
 } from "../result.js";
 import type { SessionStore } from "../session-store.js";
+import {
+  finalizeTestOutput,
+  keepUtf8TailSilent,
+} from "../test-output.js";
 import { narrowReadOnlyTools, unionDisallowedTools } from "../tool-ids.js";
 import type {
   ExecutionMode,
@@ -448,11 +452,23 @@ export function buildModeFlags(
   };
 }
 
-async function runTests(
+/**
+ * Run optional `test_command` on the host and return a capped, redacted result.
+ *
+ * Output budget is by **outcome**, not `response_mode`:
+ * - exit 0 → `maxSuccessBytes` (green runs are mostly ✓ noise)
+ * - non-zero → `maxFailureBytes` (caller needs the failure forensics)
+ *
+ * While streaming, only the failure-budget tail is retained (byte-accurate) so
+ * memory stays bounded; the final step redacts then re-applies the outcome
+ * budget, keeping the **tail** and reporting `output_truncated` honestly.
+ */
+export async function runTests(
   command: string,
   cwd: string,
   timeoutMs: number,
-  maxOutput: number,
+  maxFailureBytes: number,
+  maxSuccessBytes: number,
 ): Promise<TestsResult> {
   return new Promise((resolve) => {
     // Non-login shell: avoid sourcing the user profile (wider blast radius +
@@ -464,6 +480,10 @@ async function runTests(
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
+    let rawReceivedBytes = 0;
+    let streamDropped = false;
+    // Stream memory bound = failure budget (the larger of the two outcome caps).
+    const streamCap = Math.max(maxFailureBytes, maxSuccessBytes);
     const timer = setTimeout(() => {
       try {
         child.kill("SIGKILL");
@@ -472,30 +492,45 @@ async function runTests(
       }
     }, timeoutMs);
     const onData = (d: Buffer) => {
+      rawReceivedBytes += d.length;
       out += d.toString("utf8");
-      if (Buffer.byteLength(out, "utf8") > maxOutput) {
-        out = out.slice(-maxOutput);
+      if (Buffer.byteLength(out, "utf8") > streamCap) {
+        streamDropped = true;
+        // Byte-accurate tail (not string.slice, which is UTF-16 code units).
+        out = keepUtf8TailSilent(out, streamCap);
       }
     };
     child.stdout?.on("data", onData);
     child.stderr?.on("data", onData);
-    child.on("close", (code) => {
-      clearTimeout(timer);
+    const finish = (code: number, raw: string) => {
+      const finalized = finalizeTestOutput(
+        raw,
+        code,
+        maxFailureBytes,
+        maxSuccessBytes,
+        { streamDropped, rawReceivedBytes },
+      );
       resolve({
         ran: true,
         command,
-        exit_code: code ?? 1,
-        output: redactText(out, maxOutput),
+        exit_code: code,
+        output: finalized.output,
+        output_truncated: finalized.output_truncated,
+        ...(finalized.original_output_bytes !== undefined
+          ? { original_output_bytes: finalized.original_output_bytes }
+          : {}),
       });
+    };
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      finish(code ?? 1, out);
     });
     child.on("error", (err) => {
       clearTimeout(timer);
-      resolve({
-        ran: true,
-        command,
-        exit_code: 1,
-        output: redactText(String(err), maxOutput),
-      });
+      // Spawn failure: treat as a failed run with the error text as output.
+      rawReceivedBytes = Buffer.byteLength(String(err), "utf8");
+      streamDropped = false;
+      finish(1, String(err));
     });
   });
 }
@@ -796,6 +831,8 @@ export async function runTool(
 
     let tests: TestsResult = emptyTests();
     if (params.testCommand) {
+      // Outcome budgets — not response_mode. compact/summary_only must still
+      // return full failure output; see finalizeTestOutput / test-output.ts.
       tests = await runTests(
         params.testCommand,
         inspectCwd,
@@ -803,7 +840,8 @@ export async function runTool(
           params.testTimeoutMs ?? DEFAULT_TIMEOUTS_MS.test_command,
           config.maxTimeoutMs,
         ),
-        64_000,
+        config.maxTestOutputBytes,
+        config.maxTestOutputSuccessBytes,
       );
       if (params.failOnTestFailure && tests.exit_code !== 0) {
         throw new GrokMcpError(

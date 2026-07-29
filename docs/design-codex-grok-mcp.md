@@ -604,6 +604,10 @@ interface TestsResult {
   command?: string;
   exit_code?: number;
   output?: string;
+  /** True when returned `output` was cut to the outcome budget. Unrun → false. */
+  output_truncated: boolean;
+  /** UTF-8 byte length before truncation; present only when `output_truncated`. */
+  original_output_bytes?: number;
   parsed?: {
     passed?: number;
     failed?: number;
@@ -641,6 +645,12 @@ when the parent only needs to know *what* changed.
 **Decision.** Add an optional `response_mode` input to every tool. It changes only how
 much of the **already redacted** patch is transported — never what Grok is allowed to
 do, where it runs, or what is redacted.
+
+**Scope (normative).** `response_mode` governs the `diff` field (inline vs artifact vs
+omitted) **only**. It does **not** cap `tests.output` or `summary`. Those fields have
+their own independent budgets so a `compact` call with a large green test log cannot
+still blow the host limit, and so a failing test run still returns full forensics under
+`summary_only` / `compact`.
 
 | Mode | `diff` body | Artifact | Notes |
 |------|-------------|----------|-------|
@@ -815,7 +825,12 @@ Run in `effective_cwd` (worktree or original). Output must be **`git apply`-frie
 - **Sandbox escape (documented threat):** `test_command` runs on the **host outside Grok’s sandbox**. Grok may have written arbitrary files into the worktree; the host shell then executes the command with the user’s PATH. Only pass `test_command` for prompts and repositories you trust. Commands can still `cd` elsewhere (no full jail).
 - **Tool success**: if Grok succeeded, tool remains success even if tests fail; `tests.exit_code != 0`.  
   If `fail_on_test_failure: true`, then `isError: true` with code `GROK_MCP_TESTS_FAILED`.
-- No `test_command` → `tests: { ran: false }`.
+- No `test_command` → `tests: { ran: false, output_truncated: false }`.
+- **Output volume (independent of `response_mode`).** Cap `tests.output` by **outcome**, not by mode:
+  - `exit_code === 0` → `GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES` (default 4 KiB). Green runs are mostly `✓` noise.
+  - non-zero → `GROK_MCP_MAX_TEST_OUTPUT_BYTES` (default 64 KiB). Failure forensics the caller needs.
+  - Do **not** shrink failure output under `compact` / `summary_only` — hiding why tests failed to save bytes is the wrong trade.
+  - Final truncation keeps the **tail** (byte-accurate UTF-8; leading `... [test output truncated] ` marker) and reports `output_truncated` / `original_output_bytes` (mirror of `diff_truncated` / `original_diff_bytes`). Redact before return.
 
 ### Timeout & cancellation (implementer state machine)
 
@@ -1568,7 +1583,8 @@ GROK_MCP_ALLOWED_ROOTS = "/Users/YOU/Documents:/Users/YOU/src"
 - response-mode: auto threshold boundaries; explicit modes; hard-cap downgrade; `diff_stats` parsing; `diff_sha256` / `diff_bytes` (multi-byte safe); `next_actions`
 - absolute cap: `0` / negative = disabled; exact-cap boundary; never splits a multi-byte code point; cuts on a line boundary; cap smaller than the marker; `original_diff_bytes` reported
 - diff-artifact: path stays under the cache root; non-UUID id rejected; symlinked scope dir rejected; planted symlink target untouched; `0600`; concurrent writes never collide; GC removes only managed artifacts and never symlinks / outside-root files
-- config: `GROK_MCP_INLINE_DIFF_MAX_BYTES` valid, `0`, negative, `NaN`, fractional, non-numeric, over-ceiling; `GROK_MCP_MAX_DIFF_BYTES` defaults to `0` (unlimited)
+- config: `GROK_MCP_INLINE_DIFF_MAX_BYTES` valid, `0`, negative, `NaN`, fractional, non-numeric, over-ceiling; `GROK_MCP_MAX_DIFF_BYTES` defaults to `0` (unlimited); `GROK_MCP_MAX_TEST_OUTPUT_BYTES` / `GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES` valid, `0`, negative, non-numeric, over-ceiling
+- test-output: passing run → success budget + `output_truncated`; failing run → failure budget, tail preserved; short output untouched; multi-byte never split mid-character; redaction before return
 - schema: `response_mode` defaults to `auto` when omitted; invalid value → `GROK_MCP_INVALID_ARGS` envelope
 
 ### Integration (mock-grok)
@@ -1582,6 +1598,7 @@ GROK_MCP_ALLOWED_ROOTS = "/Users/YOU/Documents:/Users/YOU/src"
 - continue: per-call `response_mode` override, default `auto` (not inherited), distinct artifact per call
 - read_only: pre-existing WIP still suppressed, `test_command` still rejected, `UNEXPECTED_MUTATION` still reported
 - diff completeness: a >1 MiB patch is neither truncated nor cut in the artifact; secret-path omission and an oversized untracked file both yield `diff_complete: false`; the opt-in cap sets `diff_truncated` + `original_diff_bytes` and the stored bytes still match `diff_sha256`
+- test output: `compact` + passing `test_command` returns a small `tests.output` (outcome budget, not mode) so the total MCP response stays bounded
 
 ### Contract
 

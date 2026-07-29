@@ -31,6 +31,18 @@ export interface ServerConfig {
   maxPromptDiffBytes: number;
   maxUntrackedFileBytes: number;
   maxStderrBytes: number;
+  /**
+   * Cap on `tests.output` for a **failing** test run (non-zero exit_code).
+   * Passing runs use the smaller `maxTestOutputSuccessBytes` budget instead.
+   * Independent of `response_mode` — failure output is never shrunk by compact.
+   */
+  maxTestOutputBytes: number;
+  /**
+   * Cap on `tests.output` for a **passing** test run (exit_code === 0).
+   * Passing output is almost pure noise; keep it small so it cannot dominate
+   * the MCP response after the diff has already been compacted.
+   */
+  maxTestOutputSuccessBytes: number;
   /** `response_mode: "auto"` inlines the diff while it is <= this many bytes. */
   inlineDiffMaxBytes: number;
   /** Absolute ceiling for an inlined diff; larger bodies degrade to `compact`. */
@@ -72,6 +84,14 @@ export const INLINE_DIFF_BYTES_CEILING = 16 * 1024 * 1024;
 /** `0` = unlimited. Truncation is opt-in; oversize alone moves a diff to an artifact. */
 export const DEFAULT_MAX_DIFF_BYTES = 0;
 export const MAX_DIFF_BYTES_CEILING = 512 * 1024 * 1024;
+/**
+ * Defaults + hard ceiling for optional `test_command` output.
+ * Failure budget matches the historical hard-coded 64 KiB; success is much
+ * smaller so a green run cannot blow the MCP response after a compact diff.
+ */
+export const DEFAULT_MAX_TEST_OUTPUT_BYTES = 65_536;
+export const DEFAULT_MAX_TEST_OUTPUT_SUCCESS_BYTES = 4_096;
+export const MAX_TEST_OUTPUT_BYTES_CEILING = 16 * 1024 * 1024;
 
 /**
  * Byte-limit env parsing with fail-safe validation.
@@ -245,6 +265,28 @@ export function loadConfig(): ServerConfig {
       524_288,
     ),
     maxStderrBytes: parseIntEnv(process.env.GROK_MCP_MAX_STDERR_BYTES, 64_000),
+    maxTestOutputBytes: parseByteLimitEnv(
+      "GROK_MCP_MAX_TEST_OUTPUT_BYTES",
+      process.env.GROK_MCP_MAX_TEST_OUTPUT_BYTES,
+      sanitizeByteLimit(
+        "maxTestOutputBytes",
+        fileCfg.maxTestOutputBytes,
+        DEFAULT_MAX_TEST_OUTPUT_BYTES,
+        MAX_TEST_OUTPUT_BYTES_CEILING,
+      ),
+      MAX_TEST_OUTPUT_BYTES_CEILING,
+    ),
+    maxTestOutputSuccessBytes: parseByteLimitEnv(
+      "GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES",
+      process.env.GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES,
+      sanitizeByteLimit(
+        "maxTestOutputSuccessBytes",
+        fileCfg.maxTestOutputSuccessBytes,
+        DEFAULT_MAX_TEST_OUTPUT_SUCCESS_BYTES,
+        MAX_TEST_OUTPUT_BYTES_CEILING,
+      ),
+      MAX_TEST_OUTPUT_BYTES_CEILING,
+    ),
     inlineDiffMaxBytes: parseByteLimitEnv(
       "GROK_MCP_INLINE_DIFF_MAX_BYTES",
       process.env.GROK_MCP_INLINE_DIFF_MAX_BYTES,

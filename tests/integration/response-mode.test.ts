@@ -93,6 +93,8 @@ function makeConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     maxPromptDiffBytes: 262_144,
     maxUntrackedFileBytes: 524_288,
     maxStderrBytes: 64_000,
+    maxTestOutputBytes: 65_536,
+    maxTestOutputSuccessBytes: 4_096,
     inlineDiffMaxBytes: 65_536,
     inlineDiffHardMaxBytes: 1_048_576,
     cacheDir,
@@ -182,7 +184,7 @@ describe("response_mode end-to-end", () => {
     expect(r.changed_files).toContain("out.txt");
     expect(r.session_id).toBe("mock-session-id");
     expect(r.worktree_path).toBeTruthy();
-    expect(r.tests).toEqual({ ran: false });
+    expect(r.tests).toEqual({ ran: false, output_truncated: false });
   });
 
   it("compact artifact matches diff_sha256 and diff_bytes exactly", async () => {
@@ -765,5 +767,46 @@ describe("the pre-read untracked cap is reported, not silently swallowed", () =>
     expect(r.diff_bytes).toBe(0);
     expect(r.diff_artifact_path).toBeNull();
     expect(r.next_actions).toEqual([]);
+  });
+});
+
+describe("test output is capped independently of response_mode", () => {
+  it("compact + passing test_command returns a small tests.output", async () => {
+    const repo = initRepo();
+    // Tiny success budget so a noisy green run cannot dominate the response.
+    const ctx = makeCtx(
+      makeConfig({
+        maxTestOutputBytes: 65_536,
+        maxTestOutputSuccessBytes: 256,
+      }),
+    );
+    // Noisy passing command: many ✓ lines, exit 0.
+    const noisyPass =
+      'i=0; while [ $i -lt 200 ]; do echo "✓ pass case $i xxxxxxxxxxxxxxxxxxxxxxxx"; i=$((i+1)); done; exit 0';
+    const r = await runTool(
+      { ...ctx, config: { ...ctx.config, grokBin: mockWritingLines(3) } },
+      {
+        tool: "grok_implement",
+        prompt: "make a change",
+        workingDirectory: repo,
+        mode: "write_worktree",
+        keepWorktree: true,
+        responseMode: "compact",
+        testCommand: noisyPass,
+      },
+    );
+
+    expect(r.response_mode_effective).toBe("compact");
+    expect(r.tests.ran).toBe(true);
+    expect(r.tests.exit_code).toBe(0);
+    expect(r.tests.output_truncated).toBe(true);
+    expect(r.tests.original_output_bytes).toBeGreaterThan(256);
+    expect(Buffer.byteLength(r.tests.output ?? "", "utf8")).toBeLessThanOrEqual(
+      256,
+    );
+    // The whole MCP payload stays bounded: compact dropped the diff body and
+    // the green test log no longer contributes tens of KiB of noise.
+    const payload = JSON.stringify(r);
+    expect(Buffer.byteLength(payload, "utf8")).toBeLessThan(32_000);
   });
 });

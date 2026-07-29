@@ -223,6 +223,13 @@ export interface TestsResult {
   command?: string;
   exit_code?: number;
   output?: string;
+  /**
+   * True when returned `output` was cut to the outcome budget (success vs
+   * failure). Unrun tests (`ran: false`) are never truncated.
+   */
+  output_truncated: boolean;
+  /** UTF-8 byte length before truncation; present only when `output_truncated`. */
+  original_output_bytes?: number;
   parsed?: {
     passed?: number;
     failed?: number;

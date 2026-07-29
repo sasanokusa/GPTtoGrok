@@ -21,7 +21,7 @@ Every successful call returns versioned JSON (`result_version: 1`) with:
 - `summary` — agent text (redacted)
 - `changed_files` — relative paths (secret basenames omitted)
 - `diff` — apply-friendly patch (untracked files included; **secret-path hunks omitted**). Empty string when `diff_included` is `false` — see [Response modes](#response-modes)
-- `tests` — optional `test_command` result (**write_worktree only**; rejected in effective `read_only`)
+- `tests` — optional `test_command` result (**write_worktree only**; rejected in effective `read_only`). Includes `output_truncated` / `original_output_bytes` when the outcome budget cut the log — see [Test output caps](#test-output-caps)
 - `session_id` — for `grok_continue`
 - `worktree_path` — isolated tree for write modes
 - `warnings` — e.g. `ORIGINAL_TREE_DIRTY`, `UNEXPECTED_MUTATION`, `REDACTED_SECRET_PATHS`
@@ -34,7 +34,7 @@ Every successful call returns versioned JSON (`result_version: 1`) with:
 | `reasoning_effort` | Public enum: `none` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. Mapped 1:1 to Grok CLI `--reasoning-effort`. |
 | `model` | Passed as `-m`. For deeper analysis on current Grok, prefer **Grok 4.5** with `reasoning_effort: "high"`. |
 | `test_command` | Allowed only when the **effective** mode is `write_worktree`. Effective `read_only` → `GROK_MCP_INVALID_ARGS`. |
-| `response_mode` | `auto` (default) \| `full` \| `compact` \| `summary_only`. Controls how much diff the MCP response carries. See [Response modes](#response-modes). |
+| `response_mode` | `auto` (default) \| `full` \| `compact` \| `summary_only`. Controls how much of the **diff** the MCP response carries — not test output or summary. See [Response modes](#response-modes). |
 | `tools` / `disallowed_tools` | See [read_only policy](#readonly-policy) below. |
 | `permission_mode` / `sandbox` / `allow_subagents` | Restricted in `read_only` (see below). |
 
@@ -52,8 +52,12 @@ Example (analyze with Grok 4.5 high effort):
 ## Response modes
 
 A large Grok diff returned in full burns MCP response size and parent-model context on
-every call. `response_mode` controls how much of the patch travels back to Codex /
+every call. `response_mode` controls how much of the **patch** travels back to Codex /
 Claude Code — **without** weakening isolation, redaction, or session continuity.
+
+**Scope.** `response_mode` governs the `diff` field (and its artifact transport) only.
+`tests.output` and `summary` have their own independent caps and are **not** shrunk by
+`compact` / `summary_only`.
 
 | Mode | `diff` body | Artifact on disk | Use when |
 |------|-------------|------------------|----------|
@@ -101,6 +105,29 @@ empty-string digest, `diff_stats` all zeroes, `diff_artifact_path: null`,
 `diff_stats.files_changed` counts `diff --git` headers in the patch, so it can be
 lower than `changed_files.length` when binary or oversized files were listed but
 not fully patched.
+
+### Test output caps
+
+Optional `test_command` output is capped by **outcome**, not by `response_mode`:
+
+| Outcome | Budget env | Default |
+|---------|------------|---------|
+| `exit_code === 0` (pass) | `GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES` | 4 KiB |
+| non-zero (fail) | `GROK_MCP_MAX_TEST_OUTPUT_BYTES` | 64 KiB |
+
+A green run is almost pure noise (thousands of `✓` lines); a failing run is exactly
+what the caller needs. `compact` and `summary_only` still return the full failure
+budget — hiding why tests failed to save bytes is the wrong trade.
+
+When the budget cuts the log, the **tail** is kept (failure summaries live at the end),
+a leading `... [test output truncated] ` marker is prepended, and the result reports:
+
+| Field | Meaning |
+|-------|---------|
+| `tests.output_truncated` | `true` when the returned `output` was cut |
+| `tests.original_output_bytes` | byte length before the cut; present only when truncated |
+
+Unrun tests (`tests.ran: false`) set `output_truncated: false` and omit the original size.
 
 #### `diff_complete` — when the patch is *not* the whole story
 
@@ -410,9 +437,11 @@ A generated `package.json`, test file, or script in the worktree is therefore ex
 | `GROK_MCP_FAIL_ON_ORIGINAL_DIRTY` | `0` | Error if original tree mutates |
 | `GROK_MCP_CACHE_DIR` | `~/.cache/codex-grok-mcp` | Sessions + worktrees + diff artifacts |
 | `GROK_MCP_WORKTREE_TTL_HOURS` | `72` | TTL for worktree **and** diff-artifact GC (start-up only) |
-| `GROK_MCP_INLINE_DIFF_MAX_BYTES` | `65536` | `response_mode: "auto"` inlines the diff while it is ≤ this many bytes; above it falls back to `compact`. `0` = never inline |
+| `GROK_MCP_INLINE_DIFF_MAX_BYTES` | `65536` | `response_mode: "auto"` inlines the diff while it is ≤ this many bytes; above it falls back to `compact`. `0` = never inline. **Diff only** — does not affect `tests.output` or `summary` |
 | `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` | `1048576` | Absolute inline ceiling. A larger diff degrades to `compact` even for `response_mode: "full"` (warning `DIFF_HARD_LIMIT_APPLIED`) |
 | `GROK_MCP_MAX_DIFF_BYTES` | `0` *(unlimited)* | Opt-in absolute cap on the patch body itself. `0` disables truncation entirely — oversized diffs go to an artifact whole. A non-zero value cuts the patch and sets `diff_truncated: true` / `diff_complete: false` / `original_diff_bytes`. Max 512 MiB |
+| `GROK_MCP_MAX_TEST_OUTPUT_BYTES` | `65536` | Cap on `tests.output` for a **failing** `test_command` (non-zero exit). Tail-preserving; independent of `response_mode`. Max 16 MiB |
+| `GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES` | `4096` | Cap on `tests.output` for a **passing** `test_command` (exit 0). Green runs are mostly noise — keep this small so they cannot dominate a compact MCP response. Max 16 MiB |
 
 > **Changed in this release.** `GROK_MCP_MAX_DIFF_BYTES` used to default to 1 MiB
 > and truncate during diff collection — *before* `response_mode` ran, so even
