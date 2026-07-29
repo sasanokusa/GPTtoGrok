@@ -451,7 +451,7 @@ git -C <working_directory> diff --stat <base_ref>
 git -C <working_directory> diff <base_ref>
 ```
 
-Redact secrets, cap at `GROK_MCP_MAX_PROMPT_DIFF_BYTES` (default 256 KiB), attach to prompt under a clear fence:
+Secret-path **whole hunks** and **stat rows** are filtered/omitted (not merely content-redacted in place). Cap at `GROK_MCP_MAX_PROMPT_DIFF_BYTES` (default 256 KiB), attach to prompt under a clear fence:
 
 ```text
 ## Diff vs {base_ref} (server-injected, may be truncated)
@@ -485,6 +485,8 @@ function buildGrokArgv(opts: GrokRunOptions): string[] {
 
   if (opts.maxTurns != null) argv.push("--max-turns", String(opts.maxTurns));
   if (opts.model) argv.push("-m", opts.model);
+  // opts.reasoningEffort?: string
+  if (opts.reasoningEffort) argv.push("--reasoning-effort", opts.reasoningEffort);
 
   if (opts.tools?.length) argv.push("--tools", opts.tools.join(","));
   if (opts.disallowedTools?.length) {
@@ -620,7 +622,7 @@ Run in `effective_cwd` (worktree or original). Output must be **`git apply`-frie
 
 1. `git rev-parse --show-toplevel` → `git_root` (absolute).
 2. `git status --porcelain=v1 -uall` → parse paths → `changed_files` as paths **relative to `git_root`** (never absolute). High-confidence secret filter: drop from list; warning `REDACTED_SECRET_PATHS` if any dropped.
-3. Tracked changes: single command **`git diff HEAD`** (relative paths in headers). Exit 0/1 both OK.
+3. Tracked changes: single command **`git diff HEAD`** (relative paths in headers). Exit 0/1 both OK. Secret-path **whole hunks** (and any corresponding **stat rows**, when a stat summary is produced) are **filtered/omitted** entirely—not left as redacted placeholders inside the patch.
 4. Untracked files (status `??`): for each path not secret and not binary:
    - Compute `relpath` relative to `git_root`. If `relpath` escapes `git_root` (`..` segments after normalize) → **skip** + warning `PATH_ESCAPE_SKIPPED`.
    - Skip if size > `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` (default 512 KiB) → list in `changed_files` only + warning `UNTRACKED_TOO_LARGE`.
@@ -646,8 +648,9 @@ Run in `effective_cwd` (worktree or original). Output must be **`git apply`-frie
 
 #### Tests strategy
 
-- Optional `test_command`; run after Grok in `effective_cwd` with `stdio` pipes, scrubbed env, `timeout_ms` (default 300s).
-- Shell: `['/bin/sh', '-lc', test_command]` — local trust model; document that commands can `cd` elsewhere (no full jail).
+- `test_command` is **schema-visible** on shared inputs (and `grok_continue`) but **rejected** when the **effective** mode is `read_only` (`GROK_MCP_INVALID_ARGS`). It is allowed only when the effective mode is `write_worktree` (isolated worktree).
+- Optional `test_command`; when accepted, run after Grok in `effective_cwd` with `stdio` pipes, scrubbed env, `timeout_ms` (default 300s).
+- Shell: `['/bin/sh', '-lc', test_command]` — write_worktree isolation only; document that commands can still `cd` elsewhere (no full jail).
 - **Tool success**: if Grok succeeded, tool remains success even if tests fail; `tests.exit_code != 0`.  
   If `fail_on_test_failure: true`, then `isError: true` with code `GROK_MCP_TESTS_FAILED`.
 - No `test_command` → `tests: { ran: false }`.
@@ -835,7 +838,11 @@ const BaseToolInputSchema = z.object({
   working_directory: WorkingDirectorySchema,
   timeout_ms: z.number().int().positive().optional(),
   model: z.string().optional(),
+  reasoning_effort: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+    .optional(),
   max_turns: z.number().int().positive().optional(),
+  // Schema-visible; rejected when effective mode is read_only (allowed only for write_worktree).
   test_command: z.string().optional(),
   test_timeout_ms: z.number().int().positive().optional(),
   fail_on_test_failure: z.boolean().optional().default(false),
@@ -907,7 +914,11 @@ z.object({
   restore_code: z.boolean().optional().default(false),
   timeout_ms: z.number().int().positive().optional(),
   model: z.string().optional(),
+  reasoning_effort: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+    .optional(),
   max_turns: z.number().int().positive().optional(),
+  // Schema-visible; rejected when effective mode is read_only (allowed only for write_worktree).
   test_command: z.string().optional(),
   test_timeout_ms: z.number().int().positive().optional(),
   fail_on_test_failure: z.boolean().optional().default(false),
@@ -1061,7 +1072,7 @@ Session store as above. Optional config file `~/.config/codex-grok-mcp/config.js
 | Prompt injection to cat secrets | Medium | `--deny Read` secret globs; scaffolding; output redaction |
 | MCP stdout corruption | High | Logs only on stderr |
 | Runaway processes | Medium | Timeout from enqueue; process group kill |
-| `test_command` injection | Medium | Local trust; document; scrubbed env; optional fail flag |
+| `test_command` injection | Medium | Rejected in `read_only`; isolated `write_worktree` only; scrubbed env; optional fail flag |
 | Broad default allowedRoots=$HOME | Medium | Documented tradeoff; README recommends tightening |
 
 ### Path validation algorithm (v1)
