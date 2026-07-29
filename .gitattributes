@@ -1,0 +1,11 @@
+# Collapse the lockfile in GitHub diffs and keep it out of language stats —
+# it is generated and never worth scrolling past during review.
+package-lock.json linguist-generated=true
+
+# The mock Grok binary is executed as a real shell script by the integration
+# tests. A CRLF checkout would make the shebang line unusable.
+*.sh text eol=lf
+
+# Diff artifacts and patches are plain text regardless of local autocrlf.
+*.diff text eol=lf
+*.patch text eol=lf

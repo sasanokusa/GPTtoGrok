@@ -1,5 +1,7 @@
 # codex-grok-mcp
 
+[![CI](https://github.com/sasanokusa/GPTtoGrok/actions/workflows/ci.yml/badge.svg)](https://github.com/sasanokusa/GPTtoGrok/actions/workflows/ci.yml)
+
 Local **stdio MCP server** that lets **Codex CLI** and **Codex IDE** delegate coding work to **[Grok Build](https://grok.x.ai/)** (headless CLI).
 
 ```text
@@ -509,6 +511,25 @@ npm run build
 npm run typecheck
 npm run dev       # stdio server (for manual MCP attach)
 ```
+
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `npm ci`, `typecheck`,
+`test` and `build` on every push to `main` and on every pull request:
+
+| Runner | Node | Why |
+|--------|------|-----|
+| `ubuntu-latest` | 20 | floor of the `engines` range |
+| `ubuntu-latest` | 22 | current LTS |
+| `macos-latest` | 22 | path comparison case-folds only on Darwin (`IS_DARWIN` in [`src/path-guard.ts`](src/path-guard.ts)), so the worktree and artifact guards take a different branch there |
+
+The suite spawns real `git` and shell mocks. Each fixture repo sets its own
+`user.name` / `user.email`, so no global git identity is configured in CI.
+
+Reviewing on GitHub: `package-lock.json` is marked `linguist-generated` in
+[`.gitattributes`](.gitattributes) so it collapses in pull-request diffs, and
+[`.github/pull_request_template.md`](.github/pull_request_template.md) carries the
+contract and security checklists from `AGENTS.md`.
 
 Design: [`docs/design-codex-grok-mcp.md`](docs/design-codex-grok-mcp.md)  
 Agent notes: [`AGENTS.md`](AGENTS.md)

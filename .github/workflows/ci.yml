@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same ref makes an in-flight run moot.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      # Report every platform's result, not just the first failure.
+      fail-fast: false
+      matrix:
+        include:
+          # Floor of the `engines` range in package.json.
+          - os: ubuntu-latest
+            node: 20
+          - os: ubuntu-latest
+            node: 22
+          # Not redundant: path comparison case-folds only on Darwin
+          # (IS_DARWIN in src/path-guard.ts), and the worktree / artifact
+          # guards depend on that comparison.
+          - os: macos-latest
+            node: 22
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `prepare` runs `npm run build`, so a type error fails here already.
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      # Tests spawn real `git` and shell mocks; each fixture repo sets its own
+      # user.name/user.email, so no global git identity is needed.
+      - run: npm test
+
+      - run: npm run build

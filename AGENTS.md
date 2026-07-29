@@ -53,6 +53,10 @@ npm run build
 npm run dev   # run stdio server
 ```
 
+CI (`.github/workflows/ci.yml`) runs `npm ci` → `typecheck` → `test` → `build` on
+ubuntu (Node 20 and 22) and macOS (Node 22) for every push to `main` and every PR.
+macOS is not redundant: `normalizeForCompare` case-folds only on Darwin.
+
 ## Testing notes
 
 - Unit tests do **not** require a real Grok login.
