@@ -2,45 +2,45 @@
 
 [![CI](https://github.com/sasanokusa/GPTtoGrok/actions/workflows/ci.yml/badge.svg)](https://github.com/sasanokusa/GPTtoGrok/actions/workflows/ci.yml)
 
-Local **stdio MCP server** that lets **Codex CLI** and **Codex IDE** delegate coding work to **[Grok Build](https://grok.x.ai/)** (headless CLI).
+**Codex CLI** / **Codex IDE** からコーディング作業を **[Grok Build](https://grok.x.ai/)**（ヘッドレス CLI）へ委譲するための、ローカル **stdio MCP サーバー**です。
 
 ```text
 Codex  --stdio MCP-->  codex-grok-mcp  --spawn-->  grok --no-auto-update -p … --output-format streaming-json
 ```
 
-## Tools
+## ツール
 
-| Tool | Default mode | Purpose |
+| ツール | 既定モード | 用途 |
 |------|--------------|---------|
-| `grok_analyze` | `read_only` | Explore / explain codebase |
-| `grok_implement` | `write_worktree` | Implement features/fixes in an **isolated git worktree** |
-| `grok_review` | `read_only` | Review changes (server injects `git diff` vs `base_ref`) |
-| `grok_debug` | `write_worktree` | Debug / fix (optional `mode=read_only`) |
-| `grok_continue` | inherit | Resume prior session (`--resume`) |
+| `grok_analyze` | `read_only` | コードベースの調査・説明 |
+| `grok_implement` | `write_worktree` | **隔離された git worktree** 内で機能追加・修正を実装 |
+| `grok_review` | `read_only` | 変更のレビュー（サーバーが `base_ref` との `git diff` を注入） |
+| `grok_debug` | `write_worktree` | デバッグ・修正（`mode=read_only` も指定可） |
+| `grok_continue` | 継承 | 前回セッションの再開（`--resume`） |
 
-Every successful call returns versioned JSON (`result_version: 1`) with:
+成功した呼び出しはすべて、バージョン付き JSON（`result_version: 1`）を返します。
 
-- `summary` — agent text (redacted)
-- `changed_files` — relative paths (secret basenames omitted)
-- `diff` — apply-friendly patch (untracked files included; **secret-path hunks omitted**). Empty string when `diff_included` is `false` — see [Response modes](#response-modes)
-- `tests` — optional `test_command` result (**write_worktree only**; rejected in effective `read_only`). Includes `output_truncated` / `original_output_bytes` when the outcome budget cut the log — see [Test output caps](#test-output-caps)
-- `session_id` — for `grok_continue`
-- `worktree_path` — isolated tree for write modes
-- `warnings` — e.g. `ORIGINAL_TREE_DIRTY`, `UNEXPECTED_MUTATION`, `REDACTED_SECRET_PATHS`
-- `response_mode_requested` / `response_mode_effective`, `diff_included`, `diff_bytes`, `diff_sha256`, `diff_stats`, `diff_artifact_path`, `next_actions` — see [Response modes](#response-modes)
+- `summary` — エージェントのテキスト（redaction 済み）
+- `changed_files` — 相対パス（シークレットの basename は除外）
+- `diff` — apply 可能な patch（untracked ファイルを含む。**シークレットパスの hunk は除外**）。`diff_included` が `false` のときは空文字列 — [レスポンスモード](#レスポンスモード)を参照
+- `tests` — 任意の `test_command` の結果（**write_worktree のみ**。実効 `read_only` では拒否）。結果別の予算でログが切られた場合は `output_truncated` / `original_output_bytes` を含む — [テスト出力の上限](#テスト出力の上限)を参照
+- `session_id` — `grok_continue` 用
+- `worktree_path` — write モードでの隔離ツリー
+- `warnings` — 例: `ORIGINAL_TREE_DIRTY`、`UNEXPECTED_MUTATION`、`REDACTED_SECRET_PATHS`
+- `response_mode_requested` / `response_mode_effective`、`diff_included`、`diff_bytes`、`diff_sha256`、`diff_stats`、`diff_artifact_path`、`next_actions` — [レスポンスモード](#レスポンスモード)を参照
 
-### Shared optional inputs
+### 共通のオプション入力
 
-| Field | Notes |
+| フィールド | 備考 |
 |-------|--------|
-| `reasoning_effort` | Public enum: `none` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. Mapped 1:1 to Grok CLI `--reasoning-effort`. |
-| `model` | Passed as `-m`. For deeper analysis on current Grok, prefer **Grok 4.5** with `reasoning_effort: "high"`. |
-| `test_command` | Allowed only when the **effective** mode is `write_worktree`. Effective `read_only` → `GROK_MCP_INVALID_ARGS`. |
-| `response_mode` | `auto` (default) \| `full` \| `compact` \| `summary_only`. Controls how much of the **diff** the MCP response carries — not test output or summary. See [Response modes](#response-modes). |
-| `tools` / `disallowed_tools` | See [read_only policy](#readonly-policy) below. |
-| `permission_mode` / `sandbox` / `allow_subagents` | Restricted in `read_only` (see below). |
+| `reasoning_effort` | 公開 enum: `none` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`。Grok CLI の `--reasoning-effort` に 1:1 で対応。 |
+| `model` | `-m` として渡されます。現行 Grok で深い解析をしたい場合は **Grok 4.5** + `reasoning_effort: "high"` を推奨。 |
+| `test_command` | **実効**モードが `write_worktree` のときのみ許可。実効 `read_only` では `GROK_MCP_INVALID_ARGS`。 |
+| `response_mode` | `auto`（既定）\| `full` \| `compact` \| `summary_only`。MCP レスポンスが運ぶ **diff** の量を制御します（テスト出力や summary は対象外）。[レスポンスモード](#レスポンスモード)を参照。 |
+| `tools` / `disallowed_tools` | 後述の [read_only ポリシー](#read_only-ポリシー)を参照。 |
+| `permission_mode` / `sandbox` / `allow_subagents` | `read_only` では制限されます（後述）。 |
 
-Example (analyze with Grok 4.5 high effort):
+例（Grok 4.5・high effort で analyze）:
 
 ```json
 {
@@ -51,128 +51,100 @@ Example (analyze with Grok 4.5 high effort):
 }
 ```
 
-## Response modes
+## レスポンスモード
 
-A large Grok diff returned in full burns MCP response size and parent-model context on
-every call. `response_mode` controls how much of the **patch** travels back to Codex /
-Claude Code — **without** weakening isolation, redaction, or session continuity.
+大きな Grok の diff を毎回そのまま返すと、MCP のレスポンスサイズと親モデルのコンテキストを消費します。`response_mode` は、**patch** をどれだけ Codex / Claude Code へ返すかを制御します。**分離・redaction・セッション継続性を一切弱めません。**
 
-**Scope.** `response_mode` governs the `diff` field (and its artifact transport) only.
-`tests.output` and `summary` have their own independent caps and are **not** shrunk by
-`compact` / `summary_only`.
+**適用範囲。** `response_mode` が制御するのは `diff` フィールド（とその artifact 転送）**のみ**です。`tests.output` と `summary` はそれぞれ独立した上限を持ち、`compact` / `summary_only` によって縮小されることは**ありません**。
 
-| Mode | `diff` body | Artifact on disk | Use when |
+| モード | `diff` 本文 | ディスク上の artifact | 使いどころ |
 |------|-------------|------------------|----------|
-| `auto` *(default)* | inlined while ≤ `GROK_MCP_INLINE_DIFF_MAX_BYTES` (64 KiB) | only when it falls back to `compact` | almost always |
-| `full` | always inlined | no | you want the patch in context regardless of size |
-| `compact` | omitted (`""`) | yes → `diff_artifact_path` (only when `diff_bytes > 0`) | large refactors; read the patch only if needed |
-| `summary_only` | omitted (`""`) | no | you will review the worktree directly |
+| `auto` *(既定)* | `GROK_MCP_INLINE_DIFF_MAX_BYTES`（64 KiB）以下なら inline | `compact` へフォールバックしたときのみ | ほぼ常にこれ |
+| `full` | 常に inline | なし | サイズに関係なく patch をコンテキストに入れたいとき |
+| `compact` | 省略（`""`） | あり → `diff_artifact_path`（`diff_bytes > 0` のときのみ） | 大規模リファクタ。必要なときだけ patch を読む |
+| `summary_only` | 省略（`""`） | なし | worktree を直接レビューするとき |
 
-The response-mode fields are **additive** (no existing field was removed or retyped),
-but the default `auto` mode is **not** fully behaviour-compatible with pre-response-mode
-builds for large patches: above `GROK_MCP_INLINE_DIFF_MAX_BYTES`, `diff` is `""` and the
-patch lives at `diff_artifact_path`. Pass `response_mode: "full"` to force the old
-always-inline behaviour. Acceptable at 0.1.0 (pre-stable); `result_version` should bump
-to `2` when a stable public API is declared.
+レスポンスモード関連のフィールドは**追加のみ**です（既存フィールドの削除・型変更はありません）。ただし既定の `auto` は、レスポンスモード導入前のビルドと大きな patch について**完全な挙動互換ではありません**。`GROK_MCP_INLINE_DIFF_MAX_BYTES` を超えると `diff` は `""` になり、patch は `diff_artifact_path` に置かれます。従来の常時 inline 挙動が必要なら `response_mode: "full"` を渡してください。0.1.0（安定版前）では許容範囲とし、安定 API を宣言する時点で `result_version` を `2` へ上げる想定です。
 
-`response_mode` is accepted by **all five tools** and is **per call** — `grok_continue`
-does *not* inherit the previous call's mode; each continue defaults to `auto` again.
+`response_mode` は**5つのツールすべて**が受け付け、**呼び出しごと**に有効です。`grok_continue` は前回のモードを継承せず、各 continue で既定の `auto` に戻ります。
 
-On read-only runs (`grok_analyze`, `grok_review`, `grok_debug` with `mode=read_only`)
-the diff is normally empty, so `auto` resolves to `full` and the setting is a no-op.
-It still applies to the diff that an `UNEXPECTED_MUTATION` would surface.
+read-only 実行（`grok_analyze`、`grok_review`、`mode=read_only` の `grok_debug`）では diff は通常空なので、`auto` は `full` に解決され設定は実質無効です。ただし `UNEXPECTED_MUTATION` が表面化させる diff には引き続き適用されます。
 
-### Result fields
+### 結果フィールド
 
-Present on **every** result, in all modes:
+すべてのモードで、**すべての**結果に存在します。
 
-| Field | Meaning |
+| フィールド | 意味 |
 |-------|---------|
-| `response_mode_requested` | what the caller asked for (`"auto"` when omitted) |
-| `response_mode_effective` | `"full"` \| `"compact"` \| `"summary_only"` — what actually happened |
-| `diff_included` | `true` only when `diff` holds the complete patch |
-| `diff_bytes` | UTF-8 byte length of the **redacted** patch (regardless of `diff_included`) |
-| `diff_sha256` | SHA-256 of the redacted patch that was returned and/or stored |
-| `diff_stats` | `{ files_changed, insertions, deletions }` — parsed from the redacted patch, not from `git diff --stat` text |
-| `diff_artifact_path` | absolute path to the stored patch, or `null` |
-| `diff_complete` | `true` only when the patch represents the **whole** detected change. **Only a complete patch may be applied directly** |
-| `diff_truncated` | `true` only when an opt-in absolute byte cap cut the patch body |
-| `original_diff_bytes` | byte length before the cap; present only when `diff_truncated` |
-| `next_actions` | short hints when the diff was not inlined or is incomplete; `[]` for a complete `full`, and always `[]` when `diff_bytes` is `0` (no artifact, nothing to follow up) |
+| `response_mode_requested` | 呼び出し側が要求した値（省略時は `"auto"`） |
+| `response_mode_effective` | `"full"` \| `"compact"` \| `"summary_only"` — 実際に適用された結果 |
+| `diff_included` | `diff` に patch 本文が入っているときのみ `true` |
+| `diff_bytes` | **redaction 済み** patch の UTF-8 バイト長（`diff_included` とは独立） |
+| `diff_sha256` | 返却および／または保存された redaction 済み patch の SHA-256 |
+| `diff_stats` | `{ files_changed, insertions, deletions }` — `git diff --stat` の文字列ではなく redaction 済み patch から解析 |
+| `diff_artifact_path` | 保存された patch の絶対パス、または `null` |
+| `diff_complete` | patch が検出された変更**全体**を表すときのみ `true`。**完全な patch だけが直接 apply 可能です** |
+| `diff_truncated` | 任意設定の絶対上限が patch 本文を切ったときのみ `true` |
+| `original_diff_bytes` | 上限適用前のバイト長。`diff_truncated` のときのみ存在 |
+| `next_actions` | diff が inline されなかった、または不完全なときの短いヒント。完全な `full` では `[]`、`diff_bytes` が `0` のときも常に `[]`（artifact もなく、追う先がないため） |
 
-With no changes the shape stays consistent: `diff_bytes: 0`, `diff_sha256` = the
-empty-string digest, `diff_stats` all zeroes, `diff_artifact_path: null`,
-`diff_complete: true`, `diff_truncated: false`, `next_actions: []`.
+変更が無い場合も形は一貫します: `diff_bytes: 0`、`diff_sha256` = 空文字列のダイジェスト、`diff_stats` はすべてゼロ、`diff_artifact_path: null`、`diff_complete: true`、`diff_truncated: false`、`next_actions: []`。
 
-`diff_stats.files_changed` counts `diff --git` headers in the patch, so it can be
-lower than `changed_files.length` when binary or oversized files were listed but
-not fully patched.
+`diff_stats.files_changed` は patch 内の `diff --git` ヘッダ数を数えるため、バイナリや過大なファイルが列挙だけされて patch 化されなかった場合、`changed_files.length` より小さくなることがあります。
 
-### Test output caps
+### テスト出力の上限
 
-Optional `test_command` output is capped by **outcome**, not by `response_mode`:
+任意の `test_command` の出力は、`response_mode` ではなく**実行結果**によって上限が決まります。
 
-| Outcome | Budget env | Default |
+| 結果 | 予算の環境変数 | 既定 |
 |---------|------------|---------|
-| `exit_code === 0` (pass) | `GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES` | 4 KiB |
-| non-zero (fail) | `GROK_MCP_MAX_TEST_OUTPUT_BYTES` | 64 KiB |
+| `exit_code === 0`（成功） | `GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES` | 4 KiB |
+| 非ゼロ（失敗） | `GROK_MCP_MAX_TEST_OUTPUT_BYTES` | 64 KiB |
 
-A green run is almost pure noise (thousands of `✓` lines); a failing run is exactly
-what the caller needs. `compact` and `summary_only` still return the full failure
-budget — hiding why tests failed to save bytes is the wrong trade.
+成功したランはほぼノイズ（`✓` の行が数千）ですが、失敗したランこそ呼び出し側が必要とするものです。`compact` や `summary_only` でも**失敗時は完全な予算のまま**返します。バイト数を節約するためにテスト失敗の理由を隠すのは筋が悪いためです。
 
-When the budget cuts the log, the **tail** is kept (failure summaries live at the end),
-a leading `... [test output truncated] ` marker is prepended, and the result reports:
+予算がログを切る場合、**末尾**を保持し（失敗サマリは末尾にあるため）、先頭に `... [test output truncated] ` マーカーを付け、結果に次を報告します。
 
-| Field | Meaning |
+| フィールド | 意味 |
 |-------|---------|
-| `tests.output_truncated` | `true` when the returned `output` was cut |
-| `tests.original_output_bytes` | byte length before the cut; present only when truncated |
+| `tests.output_truncated` | 返却された `output` が切られたとき `true` |
+| `tests.original_output_bytes` | 切る前のバイト長。切られたときのみ存在 |
 
-Unrun tests (`tests.ran: false`) set `output_truncated: false` and omit the original size.
+未実行のテスト（`tests.ran: false`）は `output_truncated: false` となり、元サイズは省略されます。
 
-#### `diff_complete` — when the patch is *not* the whole story
+#### `diff_complete` — patch が変更全体を表さない場合
 
-Size alone never makes a patch incomplete: an oversized diff moves to an artifact
-intact, it is not cut. `diff_complete: false` means something was genuinely left
-out, and the patch will not reproduce the change on its own:
+サイズだけで patch が不完全になることはありません。過大な diff は切られるのではなく、そのまま artifact へ移されます。`diff_complete: false` は、**実際に何かが欠落しており、その patch だけでは変更を再現できない**ことを意味します。
 
-| Cause | Warning |
+| 原因 | 警告 |
 |-------|---------|
-| secret paths / hunks removed before the patch was assembled | `REDACTED_SECRET_PATHS` |
-| content redaction rewrote bytes in the patch (`[REDACTED]`) | `REDACTED_SECRET_CONTENT` |
-| untracked file above `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` (never read into memory) | `UNTRACKED_TOO_LARGE` |
-| binary file (tracked: git emits only a `Binary files … differ` marker; untracked: skipped by NUL sniff) or unreadable untracked file | `BINARY_SKIPPED` / `UNTRACKED_DIFF_FAILED` |
-| an opt-in absolute cap cut the body | `DIFF_TRUNCATED` (with `diff_truncated: true`) |
+| patch 組み立て前にシークレットパス／hunk を除外した | `REDACTED_SECRET_PATHS` |
+| 内容 redaction が patch 内のバイトを書き換えた（`[REDACTED]`） | `REDACTED_SECRET_CONTENT` |
+| `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` を超える untracked ファイル（メモリへ読み込まれません） | `UNTRACKED_TOO_LARGE` |
+| バイナリファイル（tracked: git は `Binary files … differ` マーカーしか出しません。untracked: NUL 検出でスキップ）または読めない untracked ファイル | `BINARY_SKIPPED` / `UNTRACKED_DIFF_FAILED` |
+| 任意設定の絶対上限が本文を切った | `DIFF_TRUNCATED`（`diff_truncated: true` を伴う） |
 
-Any of these also raise `DIFF_INCOMPLETE` and put a `Do not apply the patch as-is`
-hint first in `next_actions` (when there is a non-empty patch to warn about).
-Reconcile against `worktree_path` instead.
+いずれの場合も `DIFF_INCOMPLETE` を出し、`next_actions` の先頭に `Do not apply the patch as-is` のヒントを置きます（警告すべき非空の patch がある場合）。そのまま apply せず、`worktree_path` と突き合わせてください。
 
-**Content redaction is deliberately broad and fail-closed.** Patterns match
-things like `token: someIdentifier` or `secret = configValue` as well as real
-keys, so `diff_complete: false` + `REDACTED_SECRET_CONTENT` will show up on many
-ordinary code diffs. That is intended: the flag means *these bytes were rewritten,
-so do not `git apply` this patch blind — reconcile against `worktree_path`*.
-Patterns are not narrowed to reduce noise (AGENTS.md #2).
+**内容 redaction は意図的に広く、fail-closed です。** パターンは本物の鍵だけでなく `token: someIdentifier` や `secret = configValue` のような記述にもマッチするため、`diff_complete: false` + `REDACTED_SECRET_CONTENT` はごく普通のコード diff でも頻繁に出ます。これは意図した挙動です。このフラグは*「バイトが書き換わっているので `git apply` を盲目的に実行せず、`worktree_path` と突き合わせろ」*という意味です。ノイズを減らすためにパターンを狭めることはしません（AGENTS.md #2）。
 
-### Warnings
+### 警告
 
-| Warning | Meaning |
+| 警告 | 意味 |
 |---------|---------|
-| `DIFF_NOT_INLINED` | a non-empty patch was omitted from the response |
-| `DIFF_ARTIFACT_CREATED` | the patch was written to `diff_artifact_path` |
-| `DIFF_INCOMPLETE` | `diff_complete` is `false` — the patch omits part of the change; do not apply it as-is |
-| `DIFF_TRUNCATED` | an opt-in `GROK_MCP_MAX_DIFF_BYTES` cap cut the body. Off by default |
-| `DIFF_HARD_LIMIT_APPLIED` | `full` exceeded `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` and was degraded to `compact` — the patch is **not** truncated, it is stored whole |
-| `DIFF_ARTIFACT_WRITE_FAILED` | the artifact could not be written; the call degrades to `summary_only` rather than inlining a huge patch. `summary`, `changed_files`, `worktree_path`, `diff_stats` and `diff_sha256` are still returned |
-| `DIFF_DISCARDED_NO_ARTIFACT` | no diff body, no artifact **and** `keep_worktree: false` — the patch is unrecoverable after this call. `next_actions` tells you how to re-run |
-| `REDACTED_SECRET_PATHS` | secret-path files / hunks were dropped from the assembled patch |
-| `REDACTED_SECRET_CONTENT` | content-redaction regexes rewrote bytes in the patch (`[REDACTED]`); the body is no longer a faithful applyable patch. Can fire on innocuous code that matches the broad patterns — fail-closed by design |
+| `DIFF_NOT_INLINED` | 非空の patch がレスポンスから省略された |
+| `DIFF_ARTIFACT_CREATED` | patch が `diff_artifact_path` へ書き出された |
+| `DIFF_INCOMPLETE` | `diff_complete` が `false` — patch は変更の一部を欠いている。そのまま apply しないこと |
+| `DIFF_TRUNCATED` | 任意設定の `GROK_MCP_MAX_DIFF_BYTES` 上限が本文を切った。既定では無効 |
+| `DIFF_HARD_LIMIT_APPLIED` | `full` が `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` を超えたため `compact` へ降格。patch は切られておらず、**丸ごと**保存されている |
+| `DIFF_ARTIFACT_WRITE_FAILED` | artifact を書けなかったため、巨大な patch を inline する代わりに `summary_only` へ縮退。`summary`、`changed_files`、`worktree_path`、`diff_stats`、`diff_sha256` は返る |
+| `DIFF_DISCARDED_NO_ARTIFACT` | diff 本文も artifact も無く、**かつ** `keep_worktree: false` — この呼び出し後 patch は復旧不能。再実行方法は `next_actions` を参照 |
+| `REDACTED_SECRET_PATHS` | シークレットパスのファイル／hunk が組み立て済み patch から除外された |
+| `REDACTED_SECRET_CONTENT` | 内容 redaction の正規表現が patch 内のバイトを書き換えた（`[REDACTED]`）。本文はもはや忠実な apply 可能 patch ではない。広いパターンにより無害なコードでも発火しうる（設計上の fail-closed） |
 
-### Examples
+### 使用例
 
-**`auto` — normal use (just omit the field):**
+**`auto` — 通常利用（フィールドを省略するだけ）:**
 
 ```json
 {
@@ -181,7 +153,7 @@ Patterns are not narrowed to reduce noise (AGENTS.md #2).
 }
 ```
 
-**`full` — force the patch into context:**
+**`full` — patch を強制的にコンテキストへ入れる:**
 
 ```json
 {
@@ -191,7 +163,7 @@ Patterns are not narrowed to reduce noise (AGENTS.md #2).
 }
 ```
 
-**`compact` — big refactor, patch on disk:**
+**`compact` — 大規模リファクタ、patch はディスクへ:**
 
 ```json
 {
@@ -201,7 +173,7 @@ Patterns are not narrowed to reduce noise (AGENTS.md #2).
 }
 ```
 
-Returns:
+返却例:
 
 ```json
 {
@@ -229,7 +201,7 @@ Returns:
 }
 ```
 
-**`summary_only` — review in the worktree:**
+**`summary_only` — worktree でレビューする:**
 
 ```json
 {
@@ -239,41 +211,34 @@ Returns:
 }
 ```
 
-No patch is returned and none is written — but the change is still fully
-inspectable, because the isolated worktree is kept (`keep_worktree` defaults to
-`true`). Diff it yourself:
+patch は返されず、書き出されもしません。それでも変更は完全に確認可能です。隔離 worktree が保持されるためです（`keep_worktree` の既定は `true`）。自分で diff を取ってください:
 
 ```bash
 git -C "$WORKTREE_PATH" --no-pager diff HEAD
 ```
 
-> **Do not combine `summary_only` with `keep_worktree: false`.** That is the one
-> combination where nothing survives the call: no diff body, no artifact, no
-> worktree. The server flags it with `DIFF_DISCARDED_NO_ARTIFACT` and `next_actions`
-> tells you how to re-run, but the work itself is gone. Use `compact` instead —
-> its artifact outlives the reaped worktree.
+> **`summary_only` と `keep_worktree: false` を組み合わせないでください。** これは呼び出し後に何も残らない唯一の組み合わせです（diff 本文なし・artifact なし・worktree なし）。サーバーは `DIFF_DISCARDED_NO_ARTIFACT` で警告し `next_actions` が再実行方法を示しますが、作業そのものは失われます。代わりに `compact` を使ってください。その artifact は破棄された worktree より長く残ります。
 
-### Inspecting a `compact` result (Codex / Claude Code)
+### `compact` 結果を確認する手順
 
-1. Read `summary`, `changed_files` and `diff_stats` — usually enough to decide.
-2. Need specific files? Read them straight out of `worktree_path`.
-3. Need the whole patch? Read `diff_artifact_path` (already redacted, `0600`):
+Codex / Claude Code からの確認手順です。
+
+1. `summary`、`changed_files`、`diff_stats` を読む — たいていはこれで判断できます。
+2. 特定のファイルが見たい場合は `worktree_path` から直接読みます。
+3. patch 全体が必要な場合は `diff_artifact_path` を読みます（redaction 済み、`0600`）:
 
 ```bash
 sed -n '1,200p' "$DIFF_ARTIFACT_PATH"
 ```
 
-4. Verify integrity against `diff_sha256` before applying:
+4. apply 前に `diff_sha256` と突き合わせて完全性を検証します:
 
 ```bash
 shasum -a 256 "$DIFF_ARTIFACT_PATH"
 ```
 
-5. Check `diff_complete` first. If it is `true`, apply as usual:
-   `git -C <original> apply "$DIFF_ARTIFACT_PATH"`. If it is `false` the patch is
-   partial by design — copy the files you want out of `worktree_path` instead of
-   applying it.
-6. Continue the session at a different verbosity — `response_mode` is per call:
+5. **まず `diff_complete` を確認します。** `true` なら通常どおり `git -C <original> apply "$DIFF_ARTIFACT_PATH"` で適用できます。`false` の場合、その patch は設計上部分的なものなので、apply せずに `worktree_path` から必要なファイルをコピーしてください。
+6. 別の詳細度でセッションを継続します（`response_mode` は呼び出しごと）:
 
 ```json
 {
@@ -284,35 +249,22 @@ shasum -a 256 "$DIFF_ARTIFACT_PATH"
 }
 ```
 
-### Diff artifacts
+### diff artifact
 
-- Stored under the managed cache root: `~/.cache/codex-grok-mcp/diffs/<scope_digest>/<uuid>.diff`
-  (`GROK_MCP_CACHE_DIR` moves it). `<scope_digest>` is a SHA-256 prefix of the session id
-  (or worktree path / run id) — caller input is **never** concatenated into the path.
-- Contains **only** the redacted patch: secret-path hunks are dropped and content
-  regexes applied *before* the bytes are hashed or written. An unredacted diff is
-  never written to a temp file.
-- Written atomically: `O_CREAT|O_EXCL` temp file at mode `0600` → `fsync` → `rename`.
-  Symlinked directories and pre-planted symlink targets are rejected or replaced,
-  never followed out of the cache root.
-- Each call writes a **new** UUID file. Continuing a session does not overwrite or
-  delete earlier artifacts — they are retained until TTL GC so a parent agent can
-  still read a patch it was handed several turns ago. The result always points at
-  the newest one.
-- GC'd at server start on the same TTL as worktrees (`GROK_MCP_WORKTREE_TTL_HOURS`),
-  and only for validated managed artifacts: strictly under the realpath'd artifacts
-  root, in a scope-digest directory, a regular file (never a symlink) with a managed
-  name. Unknown paths, files outside the cache root, symlinks and their targets are
-  never deleted.
+- 管理下のキャッシュルートに保存されます: `~/.cache/codex-grok-mcp/diffs/<scope_digest>/<uuid>.diff`（`GROK_MCP_CACHE_DIR` で移動可能）。`<scope_digest>` は session id（または worktree パス / run id）の SHA-256 プレフィックスで、呼び出し側の入力がパスへ直接連結されることは**ありません**。
+- **redaction 済みの patch のみ**を格納します。シークレットパスの hunk 除外と内容正規表現の適用は、バイトをハッシュ化・書き出しする*前*に完了します。未 redaction の diff が一時ファイルへ書かれることはありません。
+- アトミックに書き込みます: `O_CREAT|O_EXCL` の一時ファイルをモード `0600` で作成 → `fsync` → `rename`。シンボリックリンクのディレクトリや事前に仕掛けられた symlink 先は拒否または置換され、キャッシュルート外へ追従することはありません。
+- 呼び出しごとに**新しい** UUID ファイルを書きます。セッションを継続しても以前の artifact を上書き・削除しません。親エージェントが数ターン前に受け取った patch を後から読めるよう、TTL GC まで保持されます。結果は常に最新のものを指します。
+- worktree と同じ TTL（`GROK_MCP_WORKTREE_TTL_HOURS`）でサーバー起動時に GC されます。削除対象は検証済みの管理下 artifact のみです（realpath 解決した artifacts ルートの厳密に下、scope digest ディレクトリ内、シンボリックリンクではない通常ファイル、管理下の命名規則）。不明なパス、キャッシュルート外のファイル、シンボリックリンクとその参照先は決して削除されません。
 
-## Requirements
+## 必要環境
 
-- Node.js **≥ 20**
-- `git` on `PATH`
-- Grok Build CLI installed and authenticated (`grok login`)
-- Codex CLI/IDE with MCP support
+- Node.js **20 以上**
+- `PATH` 上の `git`
+- Grok Build CLI がインストール済みで認証済み（`grok login`）
+- MCP 対応の Codex CLI / IDE
 
-## Install
+## インストール
 
 ```bash
 git clone <this-repo> && cd GPTtoGrok
@@ -320,223 +272,205 @@ npm install
 npm run build
 ```
 
-## Codex configuration
+## Codex の設定
 
-**Critical:** Codex defaults often use **~60s** per MCP tool. Grok implement/debug runs need much longer. Copy `examples/codex-config.toml` and set:
+**重要:** Codex の既定は MCP ツールあたり **約60秒**であることが多く、Grok の implement / debug 実行にはまったく足りません。`examples/codex-config.toml` をコピーして次を設定してください。
 
 ```toml
 [mcp_servers.codex-grok]
 command = "node"
 args = ["/ABSOLUTE/PATH/TO/GPTtoGrok/dist/index.js"]
 startup_timeout_sec = 30
-tool_timeout_sec = 2400   # REQUIRED — 40 minutes
+tool_timeout_sec = 2400   # 必須 — 40分
 enabled = true
 ```
 
-Without `tool_timeout_sec`, almost every real implement/debug call will be cancelled by Codex before Grok finishes.
+`tool_timeout_sec` が無いと、実運用の implement / debug 呼び出しはほぼ確実に Grok の完了前に Codex 側でキャンセルされます。
 
-Full example: [`examples/codex-config.toml`](examples/codex-config.toml).
+完全な例: [`examples/codex-config.toml`](examples/codex-config.toml)
 
-## Claude Code configuration
+## Claude Code の設定
 
-This server works from **Claude Code** as well as Codex. Register it once:
+このサーバーは Codex だけでなく **Claude Code** からも利用できます。一度登録すれば OK です。
 
 ```bash
-# User scope: available in every project on this machine
+# user スコープ: このマシンの全プロジェクトで利用可能
 claude mcp add codex-grok -s user -- node /ABSOLUTE/PATH/TO/GPTtoGrok/dist/index.js
 
-# Or local scope: only the current project
+# local スコープ: 現在のプロジェクトのみ
 # claude mcp add codex-grok -s local -- node /ABSOLUTE/PATH/TO/GPTtoGrok/dist/index.js
 ```
 
-Claude Code defaults for MCP timeouts are far below `grok_implement`'s 30-minute server default. Raise them to match the Codex guidance:
+Claude Code の MCP タイムアウト既定値は、`grok_implement` のサーバー既定（30分）を大きく下回ります。Codex と同様に引き上げてください。
 
-| Variable | Role | Recommended |
+| 変数 | 役割 | 推奨値 |
 |----------|------|-------------|
-| `MCP_TOOL_TIMEOUT` | Per tool-call deadline (ms) | `2400000` (40 minutes) |
-| `MCP_TIMEOUT` | Server startup / connect deadline (ms) | at least `30000` |
+| `MCP_TOOL_TIMEOUT` | ツール呼び出しごとの期限（ms） | `2400000`（40分） |
+| `MCP_TIMEOUT` | サーバー起動・接続の期限（ms） | 最低 `30000` |
 
-Example:
+例:
 
 ```bash
 export MCP_TOOL_TIMEOUT=2400000
 export MCP_TIMEOUT=30000
 ```
 
-Without raising `MCP_TOOL_TIMEOUT`, long implement/debug runs are cut off by the host before Grok finishes.
+`MCP_TOOL_TIMEOUT` を上げないと、長時間の implement / debug 実行は Grok の完了前にホスト側で打ち切られます。
 
-Env snippet: [`examples/claude-code.env.example`](examples/claude-code.env.example).
+環境変数のサンプル: [`examples/claude-code.env.example`](examples/claude-code.env.example)
 
-### Host restarts after rebuild (all hosts)
+### リビルド後はホストの再起動が必要（全ホスト共通）
 
-The MCP server process is **spawned once** when the host connects. After `npm run build`, you must **restart the host** (or reconnect/reload the MCP server) before the new `dist/` code takes effect. Editing source or rebuilding alone does not hot-reload a running server.
+MCP サーバープロセスは、ホストが接続した時点で**一度だけ** spawn されます。`npm run build` の後、新しい `dist/` のコードを反映するには**ホストの再起動**（または MCP サーバーの再接続・再読み込み）が必要です。ソースの編集やリビルドだけでは、稼働中のサーバーはホットリロードされません。
 
-## Isolation model (write tools)
+## 分離モデル（write 系ツール）
 
-Isolation is **best-effort**, not a hard OS guarantee.
+分離は **best-effort** であり、OS レベルの強い保証ではありません。
 
-**Default recipe:**
+**既定の手順:**
 
-1. Snapshot original `git status`
-2. `git worktree add` under `~/.cache/codex-grok-mcp/worktrees/<repo_hash>/<name>`
-3. Spawn Grok with `--cwd <worktree_path>` (**no** `-w`) + `--sandbox workspace`
-4. Deny Edit/Write on the original `repo_root` when the worktree is outside it
-5. Collect worktree `diff` / `changed_files`; warn if the original tree became dirty
+1. 元リポジトリの `git status` をスナップショット
+2. `~/.cache/codex-grok-mcp/worktrees/<repo_hash>/<name>` に `git worktree add`
+3. `--cwd <worktree_path>`（**`-w` は使わない**）+ `--sandbox workspace` で Grok を spawn
+4. worktree が元リポジトリの外にある場合、元の `repo_root` への Edit / Write を deny
+5. worktree の `diff` / `changed_files` を収集。元ツリーが dirty になっていれば警告
 
-The original working tree is **not** the default edit target. Codex (or you) should apply results via `worktree_path` + `diff` + `changed_files` (`git apply`, file copy, or manual review).
+元の作業ツリーは既定の編集対象では**ありません**。Codex（またはあなた）は `worktree_path` + `diff` + `changed_files` 経由で結果を適用してください（`git apply`、ファイルコピー、手動レビューなど）。
 
-Opt-in weaker path: `GROK_MCP_USE_GROK_WORKTREE=1` uses Grok’s `-w` with `sandbox=off`.
+より弱いオプトイン経路: `GROK_MCP_USE_GROK_WORKTREE=1` は Grok の `-w` を `sandbox=off` で使います。
 
-## Path safety
+## パス安全性
 
-- `working_directory` must be **absolute**
-- Resolved via `realpath` and checked against `GROK_MCP_ALLOWED_ROOTS` (default: home directory)
-- Path traversal / null bytes rejected
-- Recommend tightening roots, e.g. `GROK_MCP_ALLOWED_ROOTS=/Users/you/Documents:/Users/you/src`
+- `working_directory` は**絶対パス**必須
+- `realpath` で解決し `GROK_MCP_ALLOWED_ROOTS`（既定: ホームディレクトリ）と照合
+- パストラバーサル / NULバイトは拒否
+- ルートは絞ることを推奨。例: `GROK_MCP_ALLOWED_ROOTS=/Users/you/Documents:/Users/you/src`
 
-## read_only policy
+## read_only ポリシー
 
-Effective `read_only` (default for `grok_analyze` / `grok_review`, optional on `grok_debug` / `grok_continue`) is **fail-closed**:
+実効 `read_only`（`grok_analyze` / `grok_review` の既定。`grok_debug` / `grok_continue` では任意）は **fail-closed** です。
 
-| Control | Behavior |
+| 制御 | 挙動 |
 |---------|----------|
-| **Tool allowlist** | Default `--tools read_file,grep,list_dir`. Caller `tools` may only **narrow** that list (intersection). Mutating/unknown IDs are dropped. Empty override or empty intersection falls back to the safe allowlist (never omits `--tools`, which would open all tools). |
-| **Tool denylist** | Always includes mandatory IDs: `search_replace`, `write`, **both** shell names (`run_terminal_cmd`, `run_terminal_command`), and `Agent`. Caller `disallowed_tools` can only **add** more IDs; mandatory denies **cannot** be removed. |
-| **Subagents** | Always `--no-subagents` in read_only — even if `allow_subagents: true`. |
-| **Permission mode** | Forced `--permission-mode dontAsk`. Caller values `bypassPermissions`, `acceptEdits`, `auto`, and `default` are rejected (`GROK_MCP_INVALID_ARGS`). |
-| **Sandbox** | Default `read-only`. Caller `sandbox=off` or `sandbox=workspace` is rejected. |
-| **`test_command`** | Rejected in effective read_only. Retained only for effective `write_worktree` (runs after Grok in the worktree). |
-| **Web** | Off unless `allow_web: true` (`--disable-web-search` otherwise). |
+| **ツール allowlist** | 既定は `--tools read_file,grep,list_dir`。呼び出し側の `tools` はこのリストを**狭める**ことしかできません（積集合）。変更系・不明な ID は破棄されます。空の上書きや空の積集合は安全な allowlist にフォールバックします（`--tools` を省略すると全ツールが開いてしまうため、決して省略しません）。 |
+| **ツール denylist** | 必須 ID を常に含みます: `search_replace`、`write`、シェル系の**両方**の名前（`run_terminal_cmd`、`run_terminal_command`）、`Agent`。呼び出し側の `disallowed_tools` は ID を**追加**できるだけで、必須の deny を**外すことはできません**。 |
+| **サブエージェント** | read_only では `allow_subagents: true` でも常に `--no-subagents`。 |
+| **パーミッションモード** | `--permission-mode dontAsk` を強制。呼び出し側の `bypassPermissions`、`acceptEdits`、`auto`、`default` は拒否（`GROK_MCP_INVALID_ARGS`）。 |
+| **サンドボックス** | 既定 `read-only`。呼び出し側の `sandbox=off` / `sandbox=workspace` は拒否。 |
+| **`test_command`** | 実効 read_only では拒否。実効 `write_worktree` のときのみ保持（Grok の後に worktree 内で実行）。 |
+| **Web** | `allow_web: true` でない限り無効（それ以外は `--disable-web-search`）。 |
 
-## Secrets
+## シークレット
 
-The server:
+このサーバーは:
 
-- Does not load project `.env` into the child environment
-- Filters secret basenames (`.env`, `*.pem`, `id_rsa`, `auth.json`, …) from `changed_files`
-- **Omits whole-file secret-path hunks** from result `diff` and from **review-injected** `git diff` / `--stat` (pathspecs + hunk/stat filters; warning `REDACTED_SECRET_PATHS` when result paths are dropped)
-- Regex-redacts likely secrets in result `diff`, `summary`, stderr tails, and test output; when the **result** patch is rewritten, also sets `diff_complete: false` + `REDACTED_SECRET_CONTENT` (patterns stay broad — fail-closed, can trip on ordinary identifiers)
-- Passes Grok `--deny Read(...)` rules for common secret globs
+- プロジェクトの `.env` を子プロセスの環境へ読み込みません
+- シークレットの basename（`.env`、`*.pem`、`id_rsa`、`auth.json` など）を `changed_files` から除外します
+- 結果の `diff` および **review が注入する** `git diff` / `--stat` から、**シークレットパスのファイル単位 hunk を除外**します（pathspec + hunk/stat フィルタ。結果のパスが落ちた場合は `REDACTED_SECRET_PATHS` を警告）
+- 結果の `diff`、`summary`、stderr 末尾、テスト出力に対し、シークレットらしき文字列を正規表現で redaction します。**結果**の patch が書き換わった場合は `diff_complete: false` + `REDACTED_SECRET_CONTENT` も設定します（パターンは広いまま。fail-closed であり、普通の識別子にも反応しえます）
+- 一般的なシークレット glob に対して Grok へ `--deny Read(...)` ルールを渡します
 
-Order is fixed and shared by **every** response mode: collect → drop secret-path
-hunks → apply content redaction → measure bytes / hash → pick the response mode →
-inline **or** write the artifact. `compact` re-uses the exact string `full` would
-have inlined, so it cannot bypass redaction; no unredacted diff is ever written to
-disk.
+順序は固定で、**すべての**レスポンスモードで共通です: 収集 → シークレットパス hunk の除外 → 内容 redaction → バイト数・ハッシュの計測 → レスポンスモードの決定 → inline **または** artifact 書き出し。`compact` は `full` が inline したはずの文字列をそのまま再利用するため、redaction を迂回できません。未 redaction の diff がディスクへ書かれることはありません。
 
-This is **best-effort DLP**, not perfect secret scanning.
+これは **best-effort な DLP** であり、完全なシークレットスキャンではありません。
 
-## Security note: `test_command` runs outside Grok's sandbox
+## セキュリティ注意: `test_command` は Grok のサンドボックス外で実行される
 
-When the effective mode is `write_worktree`, optional `test_command` is executed by the MCP server on the **host** after Grok finishes:
+実効モードが `write_worktree` のとき、任意の `test_command` は Grok 完了後に MCP サーバーが**ホスト上で**実行します。
 
-- Spawn: `/bin/sh -c <test_command>` (non-login shell; profile is not sourced)
-- **cwd** is the worktree (or effective cwd), which Grok may have modified arbitrarily
-- Runs with a scrubbed environment on the host — **not** under Grok’s `--sandbox workspace`
+- 起動: `/bin/sh -c <test_command>`（非ログインシェル。プロファイルは読み込みません）
+- **cwd** は worktree（または実効 cwd）で、Grok が任意に変更している可能性があります
+- ホスト上でスクラブ済みの環境変数で実行され、Grok の `--sandbox workspace` の**下ではありません**
 
-A generated `package.json`, test file, or script in the worktree is therefore executed with the user’s host `PATH` and privileges. **Only pass `test_command` for prompts and repositories you trust.** It is rejected entirely when the effective mode is `read_only` (`GROK_MCP_INVALID_ARGS`).
+したがって、worktree 内で生成された `package.json`、テストファイル、スクリプトが、ユーザーのホスト `PATH` と権限で実行されます。**信頼できるプロンプトとリポジトリに対してのみ `test_command` を渡してください。** 実効モードが `read_only` の場合は完全に拒否されます（`GROK_MCP_INVALID_ARGS`）。
 
-## Environment variables
+## 環境変数
 
-| Variable | Default | Meaning |
+| 変数 | 既定 | 意味 |
 |----------|---------|---------|
-| `GROK_MCP_GROK_BIN` | `~/.grok/bin/grok` or `PATH` | Grok binary |
-| `GROK_MCP_ALLOWED_ROOTS` | `$HOME` | Colon-separated absolute roots |
-| `GROK_MCP_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` (stderr JSON) |
-| `GROK_MCP_MAX_CONCURRENT` | `2` | Parallel Grok runs |
-| `GROK_MCP_SANDBOX` | `workspace` | Write-mode sandbox profile |
-| `GROK_MCP_USE_GROK_WORKTREE` | `0` | Opt-in Grok `-w` path |
-| `GROK_MCP_FAIL_ON_ORIGINAL_DIRTY` | `0` | Error if original tree mutates |
-| `GROK_MCP_CACHE_DIR` | `~/.cache/codex-grok-mcp` | Sessions + worktrees + diff artifacts |
-| `GROK_MCP_WORKTREE_TTL_HOURS` | `72` | TTL for worktree **and** diff-artifact GC (start-up only) |
-| `GROK_MCP_INLINE_DIFF_MAX_BYTES` | `65536` | `response_mode: "auto"` inlines the diff while it is ≤ this many bytes; above it falls back to `compact`. `0` = never inline. **Diff only** — does not affect `tests.output` or `summary` |
-| `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` | `1048576` | Absolute inline ceiling. A larger diff degrades to `compact` even for `response_mode: "full"` (warning `DIFF_HARD_LIMIT_APPLIED`) |
-| `GROK_MCP_MAX_DIFF_BYTES` | `0` *(unlimited)* | Opt-in absolute cap on the patch body itself. `0` disables truncation entirely — oversized diffs go to an artifact whole. A non-zero value cuts the patch and sets `diff_truncated: true` / `diff_complete: false` / `original_diff_bytes`. Max 512 MiB |
-| `GROK_MCP_MAX_TEST_OUTPUT_BYTES` | `65536` | Cap on `tests.output` for a **failing** `test_command` (non-zero exit). Tail-preserving; independent of `response_mode`. Max 16 MiB |
-| `GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES` | `4096` | Cap on `tests.output` for a **passing** `test_command` (exit 0). Green runs are mostly noise — keep this small so they cannot dominate a compact MCP response. Max 16 MiB |
+| `GROK_MCP_GROK_BIN` | `~/.grok/bin/grok` または `PATH` | Grok バイナリ |
+| `GROK_MCP_ALLOWED_ROOTS` | `$HOME` | コロン区切りの絶対パスルート |
+| `GROK_MCP_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`（stderr へ JSON） |
+| `GROK_MCP_MAX_CONCURRENT` | `2` | Grok の並列実行数 |
+| `GROK_MCP_SANDBOX` | `workspace` | write モードのサンドボックスプロファイル |
+| `GROK_MCP_USE_GROK_WORKTREE` | `0` | Grok の `-w` 経路をオプトイン |
+| `GROK_MCP_FAIL_ON_ORIGINAL_DIRTY` | `0` | 元ツリーが変更されたらエラーにする |
+| `GROK_MCP_CACHE_DIR` | `~/.cache/codex-grok-mcp` | セッション + worktree + diff artifact |
+| `GROK_MCP_WORKTREE_TTL_HOURS` | `72` | worktree **および** diff artifact の GC の TTL（起動時のみ） |
+| `GROK_MCP_INLINE_DIFF_MAX_BYTES` | `65536` | `response_mode: "auto"` がこのバイト数以下の diff を inline します。超えると `compact` へフォールバック。`0` = 常に inline しない。**diff のみ**が対象で `tests.output` や `summary` には影響しません |
+| `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` | `1048576` | inline の絶対上限。これを超える diff は `response_mode: "full"` でも `compact` へ降格します（警告 `DIFF_HARD_LIMIT_APPLIED`） |
+| `GROK_MCP_MAX_DIFF_BYTES` | `0` *(無制限)* | patch 本文そのものに対する任意設定の絶対上限。`0` は切り詰めを完全に無効化し、過大な diff は丸ごと artifact へ送られます。非ゼロにすると patch を切り、`diff_truncated: true` / `diff_complete: false` / `original_diff_bytes` を設定します。最大 512 MiB |
+| `GROK_MCP_MAX_TEST_OUTPUT_BYTES` | `65536` | **失敗**した `test_command`（非ゼロ終了）の `tests.output` 上限。末尾を保持。`response_mode` とは独立。最大 16 MiB |
+| `GROK_MCP_MAX_TEST_OUTPUT_SUCCESS_BYTES` | `4096` | **成功**した `test_command`（終了コード 0）の `tests.output` 上限。成功時の出力はほぼノイズなので、compact な MCP レスポンスを圧迫しないよう小さく保ちます。最大 16 MiB |
 
-> **Changed in this release.** `GROK_MCP_MAX_DIFF_BYTES` used to default to 1 MiB
-> and truncate during diff collection — *before* `response_mode` ran, so even
-> `compact` artifacts held a silently cut patch. It is now off by default and, if
-> you set it, applies in the response-mode stage and is reported honestly. Since
-> `git`'s output is fully buffered in memory either way, the old cap bought no
-> peak-memory saving; use `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` (a pre-read cap) for
-> that.
+> **本リリースでの変更点。** `GROK_MCP_MAX_DIFF_BYTES` は以前、既定 1 MiB で diff 収集中に切り詰めを行っていました。つまり `response_mode` が動く*前*に切っていたため、`compact` の artifact ですら黙って切られた patch を保持していました。現在は既定で無効化され、設定した場合はレスポンスモード段で適用され、正直に報告されます。`git` の出力はいずれにせよメモリへ全量バッファされるため、旧来の上限はピークメモリの削減にはなっていませんでした。メモリ対策には `GROK_MCP_MAX_UNTRACKED_FILE_BYTES`（読み込み前の上限）を使ってください。
 
-The inline byte limits accept non-negative integers up to 16 MiB. Anything else —
-negative, `NaN`, fractional, non-numeric, or over the ceiling — is **ignored**: the
-default is used and a warning is written to **stderr** at startup.
+inline のバイト上限は 16 MiB までの非負整数を受け付けます。それ以外（負数、`NaN`、小数、非数値、上限超過）は**無視**され、既定値が使われるとともに起動時に **stderr** へ警告が出力されます。
 
-## Consumer workflow (Codex)
+## 利用側のワークフロー（Codex）
 
-After `grok_implement` / `grok_debug`:
+`grok_implement` / `grok_debug` の後:
 
-1. Read `worktree_path`, `changed_files`, `diff`
-2. If `diff_included` is `false`, get the patch from `diff_artifact_path` or the worktree — see [Inspecting a `compact` result](#inspecting-a-compact-result-codex--claude-code)
-3. Review the patch
-4. Apply with `git -C <original> apply` or copy files from the worktree
-5. If `warnings` includes `ORIGINAL_TREE_DIRTY`, stop auto-apply and investigate
-6. Iterate with `grok_continue` + `session_id` (does not create a new worktree)
+1. `worktree_path`、`changed_files`、`diff` を読む
+2. `diff_included` が `false` なら `diff_artifact_path` か worktree から patch を取得する — [`compact` 結果を確認する手順](#compact-結果を確認する手順)を参照
+3. patch をレビューする
+4. `git -C <original> apply` で適用するか、worktree からファイルをコピーする
+5. `warnings` に `ORIGINAL_TREE_DIRTY` が含まれる場合は自動適用を止めて調査する
+6. `grok_continue` + `session_id` で反復する（新しい worktree は作られません）
 
-### `grok_continue` (write resume)
+### `grok_continue`（write モードの再開）
 
-Write-mode continue is **strict**. It requires:
+write モードの continue は**厳格**です。次を要求します。
 
-1. A **stored** MCP session record for `session_id` (unmapped write sessions are rejected)
-2. That record’s mode is `write_worktree` and **`managed: true`** (server-created worktree)
-3. Stored `worktree_path` exists, is under the managed cache root, is **registered** via `git worktree list` for the same repo as `working_directory`, and is not the original repo root
-4. Optional caller `worktree_path` must **exactly match** the stored path (realpath); mismatches → `GROK_MCP_WORKTREE_INVALID`
+1. `session_id` に対する MCP セッションレコードが**保存済み**であること（未マップの write セッションは拒否）
+2. そのレコードのモードが `write_worktree` かつ **`managed: true`**（サーバーが作成した worktree）であること
+3. 保存された `worktree_path` が存在し、管理下のキャッシュルート配下にあり、`working_directory` と同じリポジトリに対して `git worktree list` に**登録済み**で、元リポジトリのルートではないこと
+4. 呼び出し側が `worktree_path` を渡す場合、保存されたパス（realpath）と**完全一致**すること。不一致は `GROK_MCP_WORKTREE_INVALID`
 
-Never passes `-w` on continue. Missing worktree → `GROK_MCP_WORKTREE_MISSING` (or read_only downgrade only when `allow_missing_worktree` is set **without** explicit `mode=write_worktree`).
+continue で `-w` を渡すことは決してありません。worktree が無い場合は `GROK_MCP_WORKTREE_MISSING`（`allow_missing_worktree` が指定され、**かつ**明示的な `mode=write_worktree` が無い場合のみ read_only へ降格）。
 
-### Worktree GC
+### worktree の GC
 
-TTL GC runs **at server start only** (not after tool calls) and **only removes validated managed worktrees**:
+TTL GC は**サーバー起動時のみ**実行され（ツール呼び出し後には走りません）、**検証済みの管理下 worktree だけ**を削除します。
 
-- Path must be absolute, realpath’d, **strictly under** `~/.cache/codex-grok-mcp/worktrees` (or `GROK_MCP_CACHE_DIR`)
-- Must not be the original repo root
-- Must be registered to that repo via `git worktree list`
-- Session entries must have `managed === true` (pending worktrees are always server-created)
+- パスが絶対で、`realpath` 解決済みで、`~/.cache/codex-grok-mcp/worktrees`（または `GROK_MCP_CACHE_DIR`）の**厳密に下**にあること
+- 元リポジトリのルートでないこと
+- `git worktree list` でそのリポジトリに登録されていること
+- セッションエントリは `managed === true` であること（pending worktree は常にサーバー作成）
 
-Untrusted, unregistered, or outside-root paths are **never** deleted — even if `sessions.json` is malicious.
+信頼できない、未登録、ルート外のパスは、たとえ `sessions.json` が悪意あるものでも**決して**削除されません。
 
-Diff artifacts are GC'd in the same pass on the same TTL, with the equivalent
-validation (see [Diff artifacts](#diff-artifacts)).
+diff artifact も同じパスで同じ TTL、同等の検証のもとで GC されます（[diff artifact](#diff-artifact) を参照）。
 
-## Development
+## 開発
 
 ```bash
-npm test          # unit + integration (mock grok)
+npm test          # ユニット + 統合（mock grok）
 npm run build
 npm run typecheck
-npm run dev       # stdio server (for manual MCP attach)
+npm run dev       # stdio サーバー（手動 MCP アタッチ用）
 ```
 
 ### CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `npm ci`, `typecheck`,
-`test` and `build` on every push to `main` and on every pull request:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) が、`main` への push とすべてのプルリクエストで `npm ci`、`typecheck`、`test`、`build` を実行します。
 
-| Runner | Node | Why |
+| ランナー | Node | 理由 |
 |--------|------|-----|
-| `ubuntu-latest` | 20 | floor of the `engines` range |
-| `ubuntu-latest` | 22 | current LTS |
-| `macos-latest` | 22 | path comparison case-folds only on Darwin (`IS_DARWIN` in [`src/path-guard.ts`](src/path-guard.ts)), so the worktree and artifact guards take a different branch there |
+| `ubuntu-latest` | 20 | `engines` の下限 |
+| `ubuntu-latest` | 22 | 現行 LTS |
+| `macos-latest` | 22 | パス比較は Darwin でのみ case-fold するため（[`src/path-guard.ts`](src/path-guard.ts) の `IS_DARWIN`）、worktree と artifact のガードが別分岐を通ります |
 
-The suite spawns real `git` and shell mocks. Each fixture repo sets its own
-`user.name` / `user.email`, so no global git identity is configured in CI.
+テストは実際の `git` とシェルの mock を spawn します。各フィクスチャのリポジトリが自分で `user.name` / `user.email` を設定するため、CI 側でグローバルな git identity は設定していません。
 
-Reviewing on GitHub: `package-lock.json` is marked `linguist-generated` in
-[`.gitattributes`](.gitattributes) so it collapses in pull-request diffs, and
-[`.github/pull_request_template.md`](.github/pull_request_template.md) carries the
-contract and security checklists from `AGENTS.md`.
+GitHub 上でのレビューについて: `package-lock.json` は [`.gitattributes`](.gitattributes) で `linguist-generated` としているため、プルリクエストの diff で自動的に畳まれます。また [`.github/pull_request_template.md`](.github/pull_request_template.md) が `AGENTS.md` の契約・セキュリティチェックリストを引き継ぎます。
 
-Design: [`docs/design-codex-grok-mcp.md`](docs/design-codex-grok-mcp.md)  
-Agent notes: [`AGENTS.md`](AGENTS.md)
+設計: [`docs/design-codex-grok-mcp.md`](docs/design-codex-grok-mcp.md)  
+エージェント向けメモ: [`AGENTS.md`](AGENTS.md)
 
-## Error shapes
+## エラー形式
 
-Tool failures returned from our handlers use a frozen JSON envelope:
+ハンドラから返るツール失敗は、固定された JSON エンベロープを使います。
 
 ```json
 {
@@ -547,28 +481,28 @@ Tool failures returned from our handlers use a frozen JSON envelope:
 }
 ```
 
-Including schema failures from the handler’s explicit Zod `.parse` (converted to `GROK_MCP_INVALID_ARGS`). Path / mode / runtime errors use the same shape.
+ハンドラ内の明示的な Zod `.parse` によるスキーマ失敗も含みます（`GROK_MCP_INVALID_ARGS` へ変換）。パス / モード / 実行時エラーも同じ形式です。
 
-**Residual case:** the MCP SDK may validate the registered `inputSchema` *before* the handler runs. If the SDK rejects first, the host may see a raw JSON-RPC `-32602 Input validation error: …` instead of the envelope. That path is outside this server’s control.
+**残る例外:** MCP SDK は、ハンドラが動く*前*に登録済み `inputSchema` を検証することがあります。SDK が先に拒否した場合、ホストにはエンベロープではなく生の JSON-RPC `-32602 Input validation error: …` が見えることがあります。この経路はこのサーバーの制御外です。
 
-## Troubleshooting
+## トラブルシューティング
 
-| Symptom | Fix |
+| 症状 | 対処 |
 |---------|-----|
-| Tool cancelled after ~60s | Set `tool_timeout_sec = 2400` in Codex MCP config, **or** `MCP_TOOL_TIMEOUT=2400000` for Claude Code |
-| Changes after `npm run build` not visible | Restart the host / reconnect the MCP server (process is not hot-reloaded) |
-| `GROK_MCP_GROK_NOT_FOUND` | Install Grok CLI; set `GROK_MCP_GROK_BIN` |
-| `GROK_MCP_NOT_A_GIT_REPO` | Init git, or use `grok_analyze` (read-only) |
-| `GROK_MCP_PATH_NOT_ALLOWED` | Expand `GROK_MCP_ALLOWED_ROOTS` |
-| Orphan worktrees | `git worktree list`; remove only managed paths under `~/.cache/codex-grok-mcp/worktrees` (GC already refuses non-managed paths) |
-| Resume fails | Pass exact `session_id` from prior result; write continue needs stored **managed** same-repo registered worktree |
-| `test_command` rejected | Only valid in effective `write_worktree`; omit for analyze/review/read_only |
-| `permission_mode` / `sandbox` rejected | read_only forbids unsafe overrides (`bypassPermissions`, `off`, `workspace`, …) |
-| `diff` came back empty | Check `diff_included` / `response_mode_effective`. Read `diff_artifact_path`, or re-run with `response_mode: "full"` |
-| `DIFF_ARTIFACT_WRITE_FAILED` | Cache root not writable — check `GROK_MCP_CACHE_DIR` permissions and free space; the result degraded to `summary_only` |
-| Diff artifacts piling up | They expire on `GROK_MCP_WORKTREE_TTL_HOURS` at server start; delete `~/.cache/codex-grok-mcp/diffs` to reclaim immediately |
-| Raw `-32602` validation error | SDK rejected args before our handler; fix the field named in the message (envelope applies only after the handler runs) |
+| ツールが約60秒でキャンセルされる | Codex の MCP 設定で `tool_timeout_sec = 2400`、**または** Claude Code なら `MCP_TOOL_TIMEOUT=2400000` を設定 |
+| `npm run build` 後も変更が反映されない | ホストを再起動 / MCP サーバーを再接続（プロセスはホットリロードされません） |
+| `GROK_MCP_GROK_NOT_FOUND` | Grok CLI をインストールし `GROK_MCP_GROK_BIN` を設定 |
+| `GROK_MCP_NOT_A_GIT_REPO` | git を init するか、`grok_analyze`（読み取り専用）を使う |
+| `GROK_MCP_PATH_NOT_ALLOWED` | `GROK_MCP_ALLOWED_ROOTS` を広げる |
+| 孤立した worktree | `git worktree list` を確認し、`~/.cache/codex-grok-mcp/worktrees` 配下の管理下パスのみ削除（GC は非管理パスを元々拒否します） |
+| 再開に失敗する | 前回結果の `session_id` を正確に渡す。write の continue には保存済み・**managed**・同一リポジトリに登録済みの worktree が必要 |
+| `test_command` が拒否される | 実効 `write_worktree` でのみ有効。analyze / review / read_only では省略する |
+| `permission_mode` / `sandbox` が拒否される | read_only は危険な上書きを禁止（`bypassPermissions`、`off`、`workspace` など） |
+| `diff` が空で返る | `diff_included` / `response_mode_effective` を確認。`diff_artifact_path` を読むか、`response_mode: "full"` で再実行 |
+| `DIFF_ARTIFACT_WRITE_FAILED` | キャッシュルートが書き込み不可。`GROK_MCP_CACHE_DIR` の権限と空き容量を確認。結果は `summary_only` へ縮退しています |
+| diff artifact が溜まる | サーバー起動時に `GROK_MCP_WORKTREE_TTL_HOURS` で失効します。すぐ回収したい場合は `~/.cache/codex-grok-mcp/diffs` を削除 |
+| 生の `-32602` 検証エラー | ハンドラ到達前に SDK が引数を拒否しています。メッセージ中のフィールドを修正してください（エンベロープはハンドラ実行後にのみ適用されます） |
 
-## License
+## ライセンス
 
 MIT
