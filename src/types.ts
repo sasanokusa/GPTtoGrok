@@ -232,12 +232,19 @@ export interface TestsResult {
 }
 
 /**
- * Frozen tool result contract.
+ * Frozen tool result contract (`result_version: 1`).
  *
- * `result_version` stays **1**: the response-mode fields below are purely
- * additive and every pre-existing field keeps its meaning and type. Callers
- * that ignore them and read `diff` behave exactly as before, because the
- * default `response_mode: "auto"` inlines diffs up to the threshold.
+ * Fields added for response modes are **additive**: no pre-existing field was
+ * removed or retyped. That is not the same as full behavioural compatibility.
+ * Under the default `response_mode: "auto"`, a redacted patch larger than
+ * `GROK_MCP_INLINE_DIFF_MAX_BYTES` (64 KiB) now returns `diff: ""` with the
+ * whole patch at `diff_artifact_path`, whereas earlier builds inlined it in
+ * `diff`. A client that only reads `diff` therefore sees an empty string for
+ * large patches. Callers that must preserve the old always-inline behaviour
+ * can pass `response_mode: "full"`.
+ *
+ * Acceptable at 0.1.0 (pre-stable). Bump `result_version` to `2` when a stable
+ * public API is declared.
  */
 export interface GrokToolResult {
   result_version: 1;
@@ -278,7 +285,10 @@ export interface GrokToolResult {
   diff_truncated: boolean;
   /** UTF-8 byte length before the cap. Present only when `diff_truncated`. */
   original_diff_bytes?: number;
-  /** Short follow-up hints when the diff was not inlined or is incomplete. */
+  /**
+   * Short follow-up hints when the diff was not inlined or is incomplete.
+   * Always `[]` when `diff_bytes` is 0 (no body, no artifact, nothing to apply).
+   */
   next_actions: string[];
   meta: {
     stop_reason?: string;

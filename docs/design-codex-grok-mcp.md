@@ -649,11 +649,15 @@ do, where it runs, or what is redacted.
 | `compact` | omitted | yes | patch persisted to `diff_artifact_path` |
 | `summary_only` | omitted | no | review via `worktree_path` |
 
-`result_version` stays **1**. Every added field is additive and every pre-existing field
-keeps its type and meaning; a caller that ignores the new fields and reads `diff` behaves
-exactly as before, because the default `auto` inlines diffs up to the threshold. Bumping
-the version would have broken consumers that assert `result_version === 1` (AGENTS.md
-hard constraint 6) for no compatibility gain.
+`result_version` stays **1**. Every added field is additive and no pre-existing field was
+removed or retyped. That is **not** full behavioural compatibility under the default
+`response_mode: "auto"`: a redacted patch larger than `GROK_MCP_INLINE_DIFF_MAX_BYTES`
+(64 KiB) now returns `diff: ""` with the whole patch at `diff_artifact_path`, whereas
+earlier builds inlined it in `diff`. A client that only reads `diff` therefore sees an
+empty string for large patches. Callers that must preserve the old always-inline
+behaviour can pass `response_mode: "full"`. Keeping `result_version: 1` is acceptable at
+0.1.0 (pre-stable) and avoids breaking consumers that assert `result_version === 1`
+(AGENTS.md hard constraint 6); bump to `2` when a stable public API is declared.
 
 #### Ordering (normative — must not be reordered)
 
@@ -689,20 +693,33 @@ false`, warning `DIFF_TRUNCATED`) so a cut patch is never presented as applyable
 #### `diff_complete` (normative)
 
 `assembleDiff` returns `complete: false` whenever a detected change is dropped from the
-patch: secret paths / hunks, an untracked file over `GROK_MCP_MAX_UNTRACKED_FILE_BYTES`, a
-binary or unreadable untracked file, or a path that escaped the repo root. The response
-stage ANDs that with "not truncated" to produce `diff_complete`, and raises
-`DIFF_INCOMPLETE` plus a leading `Do not apply the patch as-is` entry in `next_actions`.
+patch: secret paths / hunks, a **tracked binary** whose `git diff HEAD` output is only a
+`Binary files … differ` marker (no payload — see below), an untracked file over
+`GROK_MCP_MAX_UNTRACKED_FILE_BYTES`, a binary or unreadable untracked file, or a path that
+escaped the repo root. The response stage ANDs that with "not truncated" to produce
+`diff_complete`, and raises `DIFF_INCOMPLETE` plus a leading `Do not apply the patch as-is`
+entry in `next_actions` (when `diff_bytes > 0`; an empty patch yields `next_actions: []`).
 
 `diff_complete` describes the **patch**, not the transport: it is independent of
 `diff_included`, so a `compact` artifact is labelled just as honestly as an inlined body.
 An empty tree (or a non-git directory) is vacuously complete — nothing was detected, so
 nothing was omitted.
 
+**Tracked binaries (deliberate fail-closed).** `git diff HEAD` without `--binary` emits
+only a header plus `Binary files a/path and b/path differ` (or `/dev/null` for
+add/delete). That marker is not a reproducible payload, so after secret-hunk filtering
+the assembly detects the marker on the filtered patch, sets `complete: false`, and
+reuses the same `BINARY_SKIPPED` warning as untracked binaries. Detection is line-start
+anchored so body content (`+Binary files…`) is not a false positive. We deliberately do
+**not** pass `git diff --binary`: it would embed base85 blobs and contradict the policy
+of excluding binary content. A future option could opt into `--binary` if a caller needs
+applyable binary patches; v1 prefers honest incompleteness over larger, riskier
+payloads.
+
 `diff_stats` is parsed from that same redacted patch (counting `diff --git` headers and
 `+`/`-` body lines) rather than scraped from `git diff --stat` text, so the numbers always
 describe exactly what was returned or stored. It can therefore report fewer files than
-`changed_files`, which also lists binary / oversized untracked files that were not patched.
+`changed_files`, which also lists binary / oversized files that were not fully patched.
 
 #### Degradation ladder (fail-closed, never "inline the raw diff")
 
@@ -766,7 +783,7 @@ Run in `effective_cwd` (worktree or original). Output must be **`git apply`-frie
 
 1. `git rev-parse --show-toplevel` → `git_root` (absolute).
 2. `git status --porcelain=v1 -uall` → parse paths → `changed_files` as paths **relative to `git_root`** (never absolute). High-confidence secret filter: drop from list; warning `REDACTED_SECRET_PATHS` if any dropped.
-3. Tracked changes: single command **`git diff HEAD`** (relative paths in headers). Exit 0/1 both OK. Secret-path **whole hunks** (and any corresponding **stat rows**, when a stat summary is produced) are **filtered/omitted** entirely—not left as redacted placeholders inside the patch.
+3. Tracked changes: single command **`git diff HEAD`** (relative paths in headers; **not** `--binary`). Exit 0/1 both OK. Secret-path **whole hunks** (and any corresponding **stat rows**, when a stat summary is produced) are **filtered/omitted** entirely—not left as redacted placeholders inside the patch. After filtering, if the remaining patch contains a line-start `Binary files … differ` marker, set `complete: false` + warning `BINARY_SKIPPED` (same code as untracked binaries). Do not resurrect the warning for a secret binary already dropped by hunk filtering.
 4. Untracked files (status `??`): for each path not secret and not binary:
    - Compute `relpath` relative to `git_root`. If `relpath` escapes `git_root` (`..` segments after normalize) → **skip** + warning `PATH_ESCAPE_SKIPPED`.
    - Skip if size > `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` (default 512 KiB) → list in `changed_files` only + warning `UNTRACKED_TOO_LARGE`.

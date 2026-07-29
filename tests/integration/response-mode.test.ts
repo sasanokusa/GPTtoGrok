@@ -306,6 +306,7 @@ describe("response_mode end-to-end", () => {
 
     expect(r.response_mode_effective).toBe("compact");
     expect(r.diff_artifact_path).toBeNull();
+    expect(r.next_actions).toEqual([]);
     expect(r.warnings).not.toContain("DIFF_ARTIFACT_CREATED");
     expect(fs.existsSync(diffArtifactsRoot(ctx.config.cacheDir))).toBe(false);
   });
@@ -755,9 +756,14 @@ describe("the pre-read untracked cap is reported, not silently swallowed", () =>
     const r = await implement({ ctx, repo, grokBin: mockWritingLines(600) });
 
     expect(r.warnings).toContain("UNTRACKED_TOO_LARGE");
+    expect(r.warnings).toContain("DIFF_INCOMPLETE");
     expect(r.diff_complete).toBe(false);
     expect(r.diff_truncated).toBe(false);
     expect(r.changed_files).toContain("out.txt");
-    expect(r.next_actions.join(" ")).toContain("Do not apply");
+    // The oversized file was never patched, so the body is empty: no artifact and
+    // no "Do not apply" hint (there is nothing to apply). Warnings still flag it.
+    expect(r.diff_bytes).toBe(0);
+    expect(r.diff_artifact_path).toBeNull();
+    expect(r.next_actions).toEqual([]);
   });
 });

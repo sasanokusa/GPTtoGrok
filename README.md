@@ -59,8 +59,15 @@ Claude Code — **without** weakening isolation, redaction, or session continuit
 |------|-------------|------------------|----------|
 | `auto` *(default)* | inlined while ≤ `GROK_MCP_INLINE_DIFF_MAX_BYTES` (64 KiB) | only when it falls back to `compact` | almost always |
 | `full` | always inlined | no | you want the patch in context regardless of size |
-| `compact` | omitted (`""`) | yes → `diff_artifact_path` | large refactors; read the patch only if needed |
+| `compact` | omitted (`""`) | yes → `diff_artifact_path` (only when `diff_bytes > 0`) | large refactors; read the patch only if needed |
 | `summary_only` | omitted (`""`) | no | you will review the worktree directly |
+
+The response-mode fields are **additive** (no existing field was removed or retyped),
+but the default `auto` mode is **not** fully behaviour-compatible with pre-response-mode
+builds for large patches: above `GROK_MCP_INLINE_DIFF_MAX_BYTES`, `diff` is `""` and the
+patch lives at `diff_artifact_path`. Pass `response_mode: "full"` to force the old
+always-inline behaviour. Acceptable at 0.1.0 (pre-stable); `result_version` should bump
+to `2` when a stable public API is declared.
 
 `response_mode` is accepted by **all five tools** and is **per call** — `grok_continue`
 does *not* inherit the previous call's mode; each continue defaults to `auto` again.
@@ -85,15 +92,15 @@ Present on **every** result, in all modes:
 | `diff_complete` | `true` only when the patch represents the **whole** detected change. **Only a complete patch may be applied directly** |
 | `diff_truncated` | `true` only when an opt-in absolute byte cap cut the patch body |
 | `original_diff_bytes` | byte length before the cap; present only when `diff_truncated` |
-| `next_actions` | short hints when the diff was not inlined or is incomplete; `[]` for a complete `full` |
+| `next_actions` | short hints when the diff was not inlined or is incomplete; `[]` for a complete `full`, and always `[]` when `diff_bytes` is `0` (no artifact, nothing to follow up) |
 
 With no changes the shape stays consistent: `diff_bytes: 0`, `diff_sha256` = the
 empty-string digest, `diff_stats` all zeroes, `diff_artifact_path: null`,
-`diff_complete: true`, `diff_truncated: false`.
+`diff_complete: true`, `diff_truncated: false`, `next_actions: []`.
 
 `diff_stats.files_changed` counts `diff --git` headers in the patch, so it can be
-lower than `changed_files.length` when binary or oversized untracked files were
-listed but not patched.
+lower than `changed_files.length` when binary or oversized files were listed but
+not fully patched.
 
 #### `diff_complete` — when the patch is *not* the whole story
 
@@ -105,11 +112,12 @@ out, and the patch will not reproduce the change on its own:
 |-------|---------|
 | secret paths / hunks removed before the patch was assembled | `REDACTED_SECRET_PATHS` |
 | untracked file above `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` (never read into memory) | `UNTRACKED_TOO_LARGE` |
-| binary or unreadable untracked file | `BINARY_SKIPPED` / `UNTRACKED_DIFF_FAILED` |
+| binary file (tracked: git emits only a `Binary files … differ` marker; untracked: skipped by NUL sniff) or unreadable untracked file | `BINARY_SKIPPED` / `UNTRACKED_DIFF_FAILED` |
 | an opt-in absolute cap cut the body | `DIFF_TRUNCATED` (with `diff_truncated: true`) |
 
 Any of these also raise `DIFF_INCOMPLETE` and put a `Do not apply the patch as-is`
-hint first in `next_actions`. Reconcile against `worktree_path` instead.
+hint first in `next_actions` (when there is a non-empty patch to warn about).
+Reconcile against `worktree_path` instead.
 
 ### Warnings
 

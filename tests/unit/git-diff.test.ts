@@ -114,6 +114,56 @@ describe("assembleDiff", () => {
     expect(result.diff).not.toContain("innocuous");
     expect(result.diff).not.toContain("changed-innocuous");
   });
+
+  it("marks a modified tracked binary as incomplete (BINARY_SKIPPED)", async () => {
+    const repo = initRepo();
+    // NUL byte → git treats the file as binary.
+    fs.writeFileSync(path.join(repo, "blob.bin"), Buffer.from([0x00, 0x01, 0x02, 0x03]));
+    execFileSync("git", ["add", "blob.bin"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "add binary"], { cwd: repo });
+    fs.writeFileSync(path.join(repo, "blob.bin"), Buffer.from([0x00, 0xff, 0xfe, 0xfd]));
+
+    const result = await assembleDiff(repo, secretCfg, { maxUntrackedFileBytes: 500_000 });
+
+    expect(result.complete).toBe(false);
+    expect(result.warnings).toContain("BINARY_SKIPPED");
+    expect(result.changedFiles).toContain("blob.bin");
+    // Marker is still in the patch (content is not embedded); completeness flags it.
+    expect(result.diff).toMatch(/^Binary files .+ and .+ differ$/m);
+  });
+
+  it("keeps complete=true for tracked text-only changes (no BINARY_SKIPPED)", async () => {
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, "README.md"), "hello world\n");
+
+    const result = await assembleDiff(repo, secretCfg, { maxUntrackedFileBytes: 500_000 });
+
+    expect(result.complete).toBe(true);
+    expect(result.warnings).not.toContain("BINARY_SKIPPED");
+    expect(result.diff).toContain("hello world");
+  });
+
+  it("does not treat a text line containing the binary marker as incomplete", async () => {
+    const repo = initRepo();
+    // The marker appears only as an *added* body line (+…), not as a git header marker.
+    fs.writeFileSync(
+      path.join(repo, "notes.txt"),
+      "Binary files a/x and b/x differ\n",
+    );
+    execFileSync("git", ["add", "notes.txt"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "add notes"], { cwd: repo });
+    fs.writeFileSync(
+      path.join(repo, "notes.txt"),
+      "Binary files a/x and b/x differ\n+Binary files a/x and b/x differ\n",
+    );
+
+    const result = await assembleDiff(repo, secretCfg, { maxUntrackedFileBytes: 500_000 });
+
+    expect(result.complete).toBe(true);
+    expect(result.warnings).not.toContain("BINARY_SKIPPED");
+    // Body content still present (with the usual '+' prefix on the added line).
+    expect(result.diff).toContain("Binary files a/x and b/x differ");
+  });
 });
 
 describe("getDiffVsRef", () => {

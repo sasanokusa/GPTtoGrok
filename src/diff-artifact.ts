@@ -202,8 +202,18 @@ export function resolveEffectiveResponseMode(opts: {
 /** Short, structured follow-up hints for the parent agent. */
 export function buildNextActions(
   effective: EffectiveResponseMode,
-  opts: { hasWorktree: boolean; diffRecoverable: boolean; diffComplete: boolean },
+  opts: {
+    hasWorktree: boolean;
+    diffRecoverable: boolean;
+    diffComplete: boolean;
+    /** UTF-8 byte length of the redacted patch; 0 ⇒ no follow-up to suggest. */
+    diffBytes: number;
+  },
 ): string[] {
+  // Empty patch: no body was inlined, no artifact was written, nothing to apply.
+  // Do not point at a null `diff_artifact_path` or invent recovery steps.
+  if (opts.diffBytes === 0) return [];
+
   // An incomplete patch must never be applied blind, whichever mode returned it.
   const incomplete = opts.diffComplete
     ? []

@@ -236,6 +236,30 @@ export function filterSecretDiffHunks(
 }
 
 /**
+ * True when the filtered tracked patch contains a git binary-difference marker.
+ *
+ * `git diff HEAD` (without `--binary`) emits only a header plus a line like
+ * `Binary files a/path and b/path differ` (or `/dev/null` for add/delete) — no
+ * payload. That patch cannot reproduce the file, so callers must treat the
+ * assembly as incomplete.
+ *
+ * Detected on the **filtered** patch so a secret binary already dropped by
+ * {@link filterSecretDiffHunks} does not resurrect a warning. Anchored at the
+ * start of a line so body content (`+Binary files…`, `-…`, or a context line
+ * starting with a space) is not matched.
+ *
+ * We deliberately do **not** pass `git diff --binary`: that would embed base85
+ * blobs in the patch and contradicts the policy of excluding binary content
+ * (untracked binaries are already skipped via {@link isBinaryBuffer}).
+ * Fail-closed reporting is preferred over larger, riskier payloads.
+ * (`--binary` remains a documented future option in the design doc only.)
+ */
+export function filteredDiffHasBinaryMarker(diff: string): boolean {
+  // Line-start only: body lines are prefixed with ' ', '+', or '-'.
+  return /^(?:Binary files .+ and .+ differ)$/m.test(diff);
+}
+
+/**
  * Best-effort insertions/deletions from a `git diff --stat` file row.
  * Uses the histogram bar after `|`; when scaled, distributes the numeric total
  * proportionally across `+`/`-` characters.
@@ -391,7 +415,8 @@ export interface DiffAssembly {
    * True when `diff` contains every change git reported for this tree.
    *
    * False when something was deliberately dropped during collection — secret
-   * paths / hunks, an untracked file over `maxUntrackedFileBytes`, a binary or
+   * paths / hunks, a tracked binary whose content is only a "Binary files …
+   * differ" marker, an untracked file over `maxUntrackedFileBytes`, a binary or
    * unreadable untracked file, a path that escaped the repo root. Such a patch
    * must not be advertised as a complete, applyable representation of the change.
    *
@@ -451,6 +476,13 @@ export async function assembleDiff(
     const filtered = filterSecretDiffHunks(tracked.stdout, redactCfg);
     if (filtered.redactedAny) {
       warnings.push("REDACTED_SECRET_PATHS");
+      omitted = true;
+    }
+    // Tracked binary changes leave only a "Binary files … differ" marker (no
+    // payload). Detect on the filtered patch so secret binaries already dropped
+    // do not resurrect BINARY_SKIPPED. See filteredDiffHasBinaryMarker.
+    if (filteredDiffHasBinaryMarker(filtered.diff)) {
+      warnings.push("BINARY_SKIPPED");
       omitted = true;
     }
     if (filtered.diff.trim()) {

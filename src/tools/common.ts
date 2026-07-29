@@ -152,7 +152,7 @@ export interface RunToolParams {
  */
 export async function applyResponseMode(opts: {
   redactedDiff: string;
-  /** False when collection dropped changes (secret paths, binary/oversized untracked). */
+  /** False when collection dropped changes (secret paths, tracked/untracked binaries, oversized untracked). */
   sourceComplete: boolean;
   requested: ResponseMode;
   inlineMaxBytes: number;
@@ -236,6 +236,7 @@ export async function applyResponseMode(opts: {
         hasWorktree: opts.hasWorktree,
         diffRecoverable,
         diffComplete,
+        diffBytes,
       }),
     },
   };

@@ -175,6 +175,7 @@ describe("buildNextActions", () => {
     hasWorktree: true,
     diffRecoverable: true,
     diffComplete: true,
+    diffBytes: 128,
   };
 
   it("is empty for full (no extra boilerplate per call)", () => {
@@ -193,6 +194,7 @@ describe("buildNextActions", () => {
       hasWorktree: false,
       diffRecoverable: true,
       diffComplete: true,
+      diffBytes: 128,
     });
     expect(actions[0]).toContain("effective_cwd");
     expect(actions[1]).toContain("response_mode");
@@ -220,12 +222,35 @@ describe("buildNextActions", () => {
       hasWorktree: true,
       diffRecoverable: false,
       diffComplete: true,
+      diffBytes: 128,
     });
     expect(actions).toHaveLength(2);
     expect(actions[0]).toContain("response_mode");
     expect(actions[1]).toContain("keep_worktree");
     // Must not point at a worktree that is about to be removed.
     expect(actions.join(" ")).not.toContain("Inspect changed_files");
+  });
+
+  it("returns [] for compact with an empty diff (no artifact was written)", () => {
+    expect(
+      buildNextActions("compact", {
+        hasWorktree: true,
+        diffRecoverable: true,
+        diffComplete: true,
+        diffBytes: 0,
+      }),
+    ).toEqual([]);
+  });
+
+  it("returns [] for summary_only with an empty diff", () => {
+    expect(
+      buildNextActions("summary_only", {
+        hasWorktree: false,
+        diffRecoverable: true,
+        diffComplete: true,
+        diffBytes: 0,
+      }),
+    ).toEqual([]);
   });
 });
 
