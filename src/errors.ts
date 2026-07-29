@@ -1,3 +1,5 @@
+import { redactText } from "./redact.js";
+
 export type GrokMcpErrorCode =
   | "GROK_MCP_INVALID_ARGS"
   | "GROK_MCP_PATH_NOT_ALLOWED"
@@ -16,7 +18,6 @@ export type GrokMcpErrorCode =
   | "GROK_MCP_WORKTREE_INVALID"
   | "GROK_MCP_SESSION_NOT_FOUND"
   | "GROK_MCP_ORIGINAL_TREE_DIRTY"
-  | "GROK_MCP_TESTS_FAILED"
   | "GROK_MCP_INTERNAL";
 
 export interface GrokMcpErrorBody {
@@ -32,6 +33,20 @@ export interface GrokMcpErrorBody {
     warnings?: string[];
     [key: string]: unknown;
   };
+}
+
+function redactUnknown(value: unknown, depth = 0): unknown {
+  if (depth > 6) return "[REDACTED_DEPTH]";
+  if (typeof value === "string") return redactText(value, 16_000);
+  if (Array.isArray(value)) return value.map((v) => redactUnknown(v, depth + 1));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = redactUnknown(v, depth + 1);
+    }
+    return out;
+  }
+  return value;
 }
 
 export class GrokMcpError extends Error {
@@ -50,11 +65,14 @@ export class GrokMcpError extends Error {
   }
 
   toBody(): GrokMcpErrorBody {
+    const redactedDetails = this.details
+      ? (redactUnknown(this.details) as GrokMcpErrorBody["details"])
+      : undefined;
     return {
       error_version: 1,
       code: this.code,
-      message: this.message,
-      ...(this.details ? { details: this.details } : {}),
+      message: redactText(this.message, 4000),
+      ...(redactedDetails ? { details: redactedDetails } : {}),
     };
   }
 }

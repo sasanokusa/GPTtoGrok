@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { GrokMcpError } from "./errors.js";
 
 export const WorkingDirectorySchema = z
   .string()
@@ -20,10 +21,39 @@ export const PermissionModeSchema = z.enum([
 ]);
 
 /** Canonical Grok CLI --reasoning-effort levels. */
-export const REASONING_EFFORT_LEVELS = ["low", "medium", "high"] as const;
+export const REASONING_EFFORT_LEVELS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORT_LEVELS)[number];
 export const ReasoningEffortSchema = z
   .enum(REASONING_EFFORT_LEVELS)
-  .describe("Grok reasoning effort: low | medium | high (passed as --reasoning-effort).");
+  .describe(
+    "Grok reasoning effort: none|minimal|low|medium|high|xhigh|max (passed as --reasoning-effort).",
+  );
+
+/**
+ * Reject test_command if present on raw tool args (security: no shell post-hooks).
+ * Zod strip would silently drop it; we fail closed instead.
+ */
+export function rejectTestCommand(args: unknown): void {
+  if (
+    args != null &&
+    typeof args === "object" &&
+    "test_command" in args &&
+    (args as { test_command?: unknown }).test_command !== undefined
+  ) {
+    throw new GrokMcpError(
+      "GROK_MCP_INVALID_ARGS",
+      "test_command is not supported (rejected for security); run tests outside the MCP server",
+    );
+  }
+}
 
 export const BaseToolInputSchema = z.object({
   prompt: z.string().min(1),
@@ -32,9 +62,6 @@ export const BaseToolInputSchema = z.object({
   model: z.string().optional(),
   max_turns: z.number().int().positive().optional(),
   reasoning_effort: ReasoningEffortSchema.optional(),
-  test_command: z.string().optional(),
-  test_timeout_ms: z.number().int().positive().optional(),
-  fail_on_test_failure: z.boolean().optional().default(false),
   include_thoughts: z.boolean().optional().default(false),
   verbatim: z.boolean().optional().default(false),
   rules: z.string().optional(),
@@ -98,9 +125,6 @@ export const ContinueInputSchema = z.object({
   model: z.string().optional(),
   max_turns: z.number().int().positive().optional(),
   reasoning_effort: ReasoningEffortSchema.optional(),
-  test_command: z.string().optional(),
-  test_timeout_ms: z.number().int().positive().optional(),
-  fail_on_test_failure: z.boolean().optional().default(false),
   include_thoughts: z.boolean().optional().default(false),
   verbatim: z.boolean().optional().default(false),
   rules: z.string().optional(),
