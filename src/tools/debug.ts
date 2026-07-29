@@ -28,6 +28,7 @@ export function registerDebug(server: McpServer, ctx: ToolContext): void {
           timeoutMs: input.timeout_ms,
           model: input.model,
           maxTurns: input.max_turns,
+          reasoningEffort: input.reasoning_effort,
           testCommand: input.test_command,
           testTimeoutMs: input.test_timeout_ms,
           failOnTestFailure: input.fail_on_test_failure,

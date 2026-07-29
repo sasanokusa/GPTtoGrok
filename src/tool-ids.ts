@@ -19,15 +19,25 @@ export type DisallowedTool = (typeof DEFAULT_DISALLOWED_TOOLS)[number];
 /**
  * Fail-closed read_only allowlist: caller may only *narrow* the configured list
  * (intersection). Unknown / mutating tools are dropped.
+ *
+ * Empty results are never returned: omitting `--tools` would let Grok expose all
+ * tools. Empty caller override or empty intersection falls back to a nonempty
+ * safe allowlist (configured list, else READ_ONLY_TOOLS).
  */
 export function narrowReadOnlyTools(
   configuredAllow: readonly string[],
   callerTools?: string[],
 ): string[] {
-  const allow = [...configuredAllow];
-  if (!callerTools?.length) return allow;
-  const allowSet = new Set(allow);
-  return callerTools.filter((t) => allowSet.has(t));
+  const safeFallback =
+    configuredAllow.length > 0 ? [...configuredAllow] : [...READ_ONLY_TOOLS];
+
+  // No override, or explicit empty array: keep safe allowlist (never open all tools).
+  if (!callerTools?.length) return safeFallback;
+
+  const allowSet = new Set(safeFallback);
+  const narrowed = callerTools.filter((t) => allowSet.has(t));
+  // Intersection empty (only mutating/unknown tools) → keep safe allowlist.
+  return narrowed.length > 0 ? narrowed : safeFallback;
 }
 
 /**
