@@ -50,6 +50,19 @@ function redactUnknown(value: unknown, depth = 0): unknown {
   return value;
 }
 
+/** Redact message + all string fields in details (stderr_tail, partial_summary, …). */
+export function redactErrorFields(
+  message: string,
+  details?: GrokMcpErrorBody["details"],
+): { message: string; details?: GrokMcpErrorBody["details"] } {
+  const redactedMessage = redactText(message, 4000);
+  if (!details) return { message: redactedMessage };
+  return {
+    message: redactedMessage,
+    details: redactUnknown(details) as GrokMcpErrorBody["details"],
+  };
+}
+
 export class GrokMcpError extends Error {
   readonly code: GrokMcpErrorCode;
   readonly details?: GrokMcpErrorBody["details"];
@@ -59,25 +72,25 @@ export class GrokMcpError extends Error {
     message: string,
     details?: GrokMcpErrorBody["details"],
   ) {
-    super(message);
+    const redacted = redactErrorFields(message, details);
+    super(redacted.message);
     this.name = "GrokMcpError";
     this.code = code;
-    this.details = details;
+    this.details = redacted.details;
   }
 
   toBody(): GrokMcpErrorBody {
-    const redactedDetails = this.details
-      ? (redactUnknown(this.details) as GrokMcpErrorBody["details"])
-      : undefined;
+    // Message/details already redacted at construction; re-run for defense in depth.
+    const again = redactErrorFields(this.message, this.details);
     return {
       error_version: 1,
       code: this.code,
-      message: redactText(this.message, 4000),
-      ...(redactedDetails ? { details: redactedDetails } : {}),
+      message: again.message,
+      ...(again.details ? { details: again.details } : {}),
     };
   }
 }
 
-export function isGrokMcpError(err: unknown): err is GrokMcpError {
+export function isGrokMcpError(err: unknown): boolean {
   return err instanceof GrokMcpError;
 }

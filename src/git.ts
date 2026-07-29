@@ -141,6 +141,200 @@ function normalizeNewFilePatch(patch: string, relpath: string): string {
   return out.join("\n");
 }
 
+/** Unquote a git path token (e.g. `"foo bar"` or plain `foo`). */
+function unquoteGitPath(token: string): string {
+  const t = token.trim();
+  if (t.startsWith('"') && t.endsWith('"')) {
+    try {
+      return JSON.parse(t) as string;
+    } catch {
+      return t.slice(1, -1);
+    }
+  }
+  return t;
+}
+
+/**
+ * Extract file path(s) from a unified-diff header line.
+ * Handles `diff --git a/X b/Y`, `--- a/X`, `+++ b/X`, and plain stat lines.
+ */
+function pathsFromDiffHeaderLine(line: string): string[] {
+  if (line.startsWith("diff --git ")) {
+    const rest = line.slice("diff --git ".length);
+    // Prefer split on " b/" then strip a/ from first; quoted paths use JSON quotes
+    const m = rest.match(/^(?:"(?:\\.|[^"])*"|[^\s]+)\s+(?:"(?:\\.|[^"])*"|[^\s]+)$/);
+    if (!m) return [];
+    const parts = rest.match(/"(?:\\.|[^"])*"|[^\s]+/g) ?? [];
+    return parts.map((p) => {
+      let s = unquoteGitPath(p);
+      if (s.startsWith("a/") || s.startsWith("b/")) s = s.slice(2);
+      return s;
+    });
+  }
+  if (line.startsWith("--- ") || line.startsWith("+++ ")) {
+    let p = line.slice(4).trim();
+    if (p === "/dev/null") return [];
+    p = unquoteGitPath(p);
+    if (p.startsWith("a/") || p.startsWith("b/")) p = p.slice(2);
+    return p ? [p] : [];
+  }
+  return [];
+}
+
+/**
+ * Drop whole-file hunks whose paths are secret basenames.
+ * Remaining hunks stay apply-friendly (headers unchanged for kept files).
+ */
+export function filterSecretDiffHunks(
+  diff: string,
+  cfg: RedactConfig,
+): { diff: string; redactedAny: boolean } {
+  if (!diff.trim()) return { diff: "", redactedAny: false };
+  const lines = diff.split("\n");
+  const keptChunks: string[][] = [];
+  let current: string[] | null = null;
+  let currentIsSecret = false;
+  let redactedAny = false;
+  let preamble: string[] = [];
+
+  const flush = () => {
+    if (current == null) return;
+    if (currentIsSecret) redactedAny = true;
+    else keptChunks.push(current);
+    current = null;
+    currentIsSecret = false;
+  };
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      flush();
+      // any preamble before first diff goes with first chunk decision
+      current = preamble.length ? [...preamble, line] : [line];
+      preamble = [];
+      const paths = pathsFromDiffHeaderLine(line);
+      currentIsSecret = paths.some((p) => isSecretPath(p, cfg));
+      continue;
+    }
+    if (current == null) {
+      preamble.push(line);
+      continue;
+    }
+    current.push(line);
+  }
+  flush();
+
+  // If there was only preamble (no diff --git), treat as opaque text
+  if (keptChunks.length === 0 && preamble.length && !redactedAny) {
+    return { diff: preamble.join("\n"), redactedAny: false };
+  }
+
+  let out = keptChunks.map((c) => c.join("\n")).join("\n");
+  if (out && !out.endsWith("\n") && diff.endsWith("\n")) out += "\n";
+  return { diff: out, redactedAny };
+}
+
+/**
+ * Drop secret-path rows from `git diff --stat` output.
+ * Summary line is recomputed from remaining file rows when possible.
+ */
+export function filterSecretStatLines(
+  stat: string,
+  cfg: RedactConfig,
+): { stat: string; redactedAny: boolean } {
+  if (!stat.trim()) return { stat: "", redactedAny: false };
+  const lines = stat.split("\n");
+  const kept: string[] = [];
+  let redactedAny = false;
+  let fileRows = 0;
+
+  for (const line of lines) {
+    // Summary: " N files changed, ..."
+    if (/^\s*\d+\s+files? changed/.test(line)) {
+      continue; // recompute below
+    }
+    // File row: " path/to/file | 12 +++---" (leading space optional)
+    const m = line.match(/^\s*(.+?)\s+\|\s+/);
+    if (m) {
+      const filePath = m[1]!.trim();
+      if (isSecretPath(filePath, cfg)) {
+        redactedAny = true;
+        continue;
+      }
+      kept.push(line);
+      fileRows += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+
+  // Drop trailing empty-only noise then add a simple summary if we had file rows
+  while (kept.length && kept[kept.length - 1] === "") kept.pop();
+  if (fileRows > 0) {
+    kept.push(
+      ` ${fileRows} file${fileRows === 1 ? "" : "s"} changed (secret paths omitted)`,
+    );
+  }
+  let out = kept.join("\n");
+  if (out && stat.endsWith("\n")) out += "\n";
+  return { stat: out, redactedAny };
+}
+
+/**
+ * Validate base_ref before passing to git: no NUL, no leading dash (option injection).
+ */
+export function assertSafeBaseRef(baseRef: string): void {
+  if (typeof baseRef !== "string" || baseRef.length === 0) {
+    throw new GrokMcpError("GROK_MCP_INVALID_ARGS", "base_ref must be a non-empty string");
+  }
+  if (baseRef.includes("\0")) {
+    throw new GrokMcpError(
+      "GROK_MCP_INVALID_ARGS",
+      "base_ref must not contain NUL bytes",
+    );
+  }
+  if (/[\r\n]/.test(baseRef)) {
+    throw new GrokMcpError(
+      "GROK_MCP_INVALID_ARGS",
+      "base_ref must not contain newlines",
+    );
+  }
+  if (baseRef.startsWith("-")) {
+    throw new GrokMcpError(
+      "GROK_MCP_INVALID_ARGS",
+      "base_ref must not start with '-' (option injection)",
+    );
+  }
+}
+
+/**
+ * Verify base_ref is a commit-ish and return the resolved object name.
+ * Uses `--end-of-options` so the ref cannot be parsed as a git option.
+ */
+export async function verifyBaseRef(cwd: string, baseRef: string): Promise<string> {
+  assertSafeBaseRef(baseRef);
+  // Prefer commit-ish; fall back to any object that rev-parse accepts for diff.
+  const r = await runGit(
+    ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`],
+    cwd,
+  );
+  if (r.exitCode !== 0) {
+    // Some refs (e.g. tree-ish) may not resolve with ^{commit}; try plain verify.
+    const r2 = await runGit(
+      ["rev-parse", "--verify", "--end-of-options", baseRef],
+      cwd,
+    );
+    if (r2.exitCode !== 0) {
+      throw new GrokMcpError(
+        "GROK_MCP_INVALID_ARGS",
+        `base_ref is not a valid revision: ${baseRef}`,
+        { stderr_tail: (r.stderr || r2.stderr).slice(-500) },
+      );
+    }
+    return r2.stdout.trim().split("\n")[0]!.trim();
+  }
+  return r.stdout.trim().split("\n")[0]!.trim();
+}
+
 export interface DiffAssembly {
   changedFiles: string[];
   diff: string;
@@ -168,12 +362,16 @@ export async function assembleDiff(
   const { kept, redacted } = filterSecretPaths(parsed.all, redactCfg);
   if (redacted.length) warnings.push("REDACTED_SECRET_PATHS");
 
-  // Tracked diff
-  const tracked = await runGit(["diff", "HEAD"], gitRoot);
+  // Tracked diff — then strip secret-path hunks (tracked .env etc. must not leak)
+  const tracked = await runGit(["diff", "HEAD", "--"], gitRoot);
   // exit 0 or 1 both OK
   let diffParts: string[] = [];
   if (tracked.stdout.trim()) {
-    diffParts.push(tracked.stdout.replace(/\n?$/, "\n"));
+    const filtered = filterSecretDiffHunks(tracked.stdout, redactCfg);
+    if (filtered.redactedAny) warnings.push("REDACTED_SECRET_PATHS");
+    if (filtered.diff.trim()) {
+      diffParts.push(filtered.diff.replace(/\n?$/, "\n"));
+    }
   }
 
   const untrackedKept = parsed.untracked.filter((p) => kept.includes(p));
@@ -235,12 +433,38 @@ export async function getDiffVsRef(
   cwd: string,
   baseRef: string,
   maxBytes: number,
-  _redactCfg: RedactConfig,
+  redactCfg: RedactConfig,
 ): Promise<{ stat: string; diff: string; empty: boolean }> {
   const root = await getRepoRoot(cwd);
-  const statR = await runGit(["diff", "--stat", baseRef], root);
-  const diffR = await runGit(["diff", baseRef], root);
-  let diff = redactText(diffR.stdout || "");
+  const verified = await verifyBaseRef(root, baseRef);
+
+  // Resolved object name is hex (or similar) — never a leading-dash option.
+  // Use `--` path separator after the revision for defense in depth.
+  const nameR = await runGit(["diff", "--name-only", verified, "--"], root);
+  const names = nameR.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const { kept, redacted } = filterSecretPaths(names, redactCfg);
+
+  if (kept.length === 0) {
+    return { stat: "", diff: "", empty: true };
+  }
+
+  // Prefer pathspecs so secret files never appear in git output at all.
+  const statR = await runGit(["diff", "--stat", verified, "--", ...kept], root);
+  const diffR = await runGit(["diff", verified, "--", ...kept], root);
+
+  // Defense in depth: strip any secret hunks/stat rows that still slipped through
+  // (e.g. renames involving a secret path, or pathspec edge cases).
+  let filteredStat = filterSecretStatLines(statR.stdout || "", redactCfg).stat;
+  let filteredDiff = filterSecretDiffHunks(diffR.stdout || "", redactCfg).diff;
+
+  if (redacted.length) {
+    // already omitted via pathspecs; keep empty marker free of secret names
+  }
+
+  let diff = redactText(filteredDiff);
   if (Buffer.byteLength(diff, "utf8") > maxBytes) {
     let truncated = diff;
     while (Buffer.byteLength(truncated, "utf8") > maxBytes - 40 && truncated.length) {
@@ -249,9 +473,9 @@ export async function getDiffVsRef(
     diff = `${truncated}\n... [diff truncated]`;
   }
   return {
-    stat: redactText(statR.stdout || ""),
+    stat: redactText(filteredStat),
     diff,
-    empty: !diffR.stdout.trim(),
+    empty: !filteredDiff.trim(),
   };
 }
 
