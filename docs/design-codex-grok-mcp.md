@@ -247,12 +247,24 @@ export const READ_ONLY_DISALLOWED = [
 ] as const;
 ```
 
-Config may override lists; unit tests pin that **both** shell IDs are always present in the default denylist.
+Config may override lists; unit tests pin that **both** shell IDs are always present in the default denylist **and cannot be removed** by caller overrides (mandatory denies form a union with any extra caller IDs).
 
 #### `read_only` — canonical policy (primary = tool filters)
 
 **Effective cwd**: resolved absolute `working_directory` (original tree).  
 **No worktree created.**
+
+Effective `read_only` (default for `grok_analyze` / `grok_review`, optional on `grok_debug` / `grok_continue`) is **fail-closed**:
+
+| Control | Behavior |
+|---------|----------|
+| **Tool allowlist** | Default `--tools read_file,grep,list_dir`. Caller `tools` may only **narrow** that list (intersection). Mutating/unknown IDs are dropped. Empty override or empty intersection falls back to the safe allowlist (never omits `--tools`, which would open all tools). |
+| **Tool denylist** | Always includes mandatory IDs: `search_replace`, `write`, **both** shell names (`run_terminal_cmd`, `run_terminal_command`), and `Agent`. Caller `disallowed_tools` can only **add** more IDs; mandatory denies **cannot** be removed (union). |
+| **Subagents** | Always `--no-subagents` in read_only — even if `allow_subagents: true`. |
+| **Permission mode** | Forced `--permission-mode dontAsk`. Caller values `bypassPermissions`, `acceptEdits`, `auto`, and `default` are rejected (`GROK_MCP_INVALID_ARGS`). |
+| **Sandbox** | Default `read-only`. Caller `sandbox=off` or `sandbox=workspace` is rejected (`GROK_MCP_INVALID_ARGS`). |
+| **`test_command`** | Rejected in effective read_only (`GROK_MCP_INVALID_ARGS`). Allowed only when the **effective** mode is `write_worktree`. |
+| **Web** | Off unless `allow_web: true` (`--disable-web-search` otherwise). |
 
 **Primary controls (required defaults)**:
 
@@ -260,6 +272,8 @@ Config may override lists; unit tests pin that **both** shell IDs are always pre
 --tools "read_file,grep,list_dir"
 --disallowed-tools "search_replace,write,run_terminal_cmd,run_terminal_command,Agent"
 --no-subagents
+--permission-mode dontAsk
+--sandbox read-only
 --deny "Read(**/.env)"
 --deny "Read(**/.env.*)"
 --deny "Read(**/*.pem)"
@@ -268,13 +282,12 @@ Config may override lists; unit tests pin that **both** shell IDs are always pre
 --deny "Read(**/auth.json)"
 ```
 
-**Secondary controls** (belt-and-suspenders only — **not** sufficient alone):
+**Secondary notes**:
 
-- Default `--permission-mode dontAsk` for headless analyze/review (not `plan`).
-  - **Why not `plan` as primary**: CLI `--permission-mode plan` is compatibility-oriented; full plan mode is enter/exit lifecycle and still allows non-edit tools (including shell if not denylisted). Engineers must not treat `plan` as a filesystem freeze.
-- Optional `--sandbox read-only` when `GROK_MCP_SANDBOX_READ_ONLY=1` or config enables it (recommended when available on the host).
+- Permission-mode is forced to `dontAsk` (not `plan`). CLI `--permission-mode plan` is compatibility-oriented and is **not** a filesystem freeze; engineers must not treat it as one.
+- Unsafe caller overrides for `permission_mode` / `sandbox` are **rejected**, not silently ignored.
 
-**Web tools**: default **off** for read_only (`web_search` / `web_fetch` not in allowlist). Callers may pass `tools` override if needed. Prefer `--disable-web-search` as an additional default for analyze/review unless `allow_web: true`.
+**Web tools**: default **off** for read_only (`web_search` / `web_fetch` not in allowlist). Prefer `--disable-web-search` unless `allow_web: true`. Caller `tools` may only **narrow** the safe allowlist (see table above).
 
 **Post-run**: if `changed_files`/`diff` non-empty under original tree → `warnings` includes `UNEXPECTED_MUTATION` (high severity text in summary prefix).
 
@@ -335,8 +348,8 @@ Grok’s `workspace` sandbox grants **write access to process CWD** (+ `~/.grok/
 
 3. **Sandbox**: default `--sandbox workspace` on the default recipe (`GROK_MCP_SANDBOX` unset). Set `off` only via config/env. On Grok-`-w` opt-in path, default sandbox is **`off`**. Original tree remains **readable**; writes outside CWD blocked when sandbox active.
 4. **Original-tree baseline** (step B / post-run): if new dirt at `repo_root` beyond git worktree bookkeeping metadata → `warnings: ["ORIGINAL_TREE_DIRTY"]` + redacted `meta.original_tree_status`. `GROK_MCP_FAIL_ON_ORIGINAL_DIRTY=1` → error `GROK_MCP_ORIGINAL_TREE_DIRTY`.
-5. **`--no-subagents`** default on unless `allow_subagents: true`.
-6. **Auto-approve**: `--always-approve`.
+5. **`--no-subagents`**: always on in **effective `read_only`** (caller `allow_subagents: true` ignored). In `write_worktree`, default on unless `allow_subagents: true`.
+6. **Auto-approve**: `--always-approve` (write modes).
 7. **Secret Read denies** (always): `--deny "Read(**/.env)"` etc.
 
 **Post-run git inspection**: `changed_files` / `diff` from the worktree (`effective_cwd = worktree_path`). Original tree only for dirty warning.
@@ -383,11 +396,13 @@ Grok’s `workspace` sandbox grants **write access to process CWD** (+ `~/.grok/
 |------|----------|
 | **Dirty original tree (WIP uncommitted)** | Proceed. Worktree is based on `worktree_ref` or HEAD **commit**, so **uncommitted WIP is not present** in the worktree. `warnings` includes `ORIGINAL_WIP_NOT_IN_WORKTREE`. Prompt scaffolding mentions this. Callers needing WIP must commit/stash first or pass a ref that contains it. |
 | **`worktree_name` collision** | Fail `GROK_MCP_WORKTREE_EXISTS`; do not overwrite. |
+| **Continue write** requires **stored** session with `mode=write_worktree`, **`managed: true`**, and a worktree that is under the managed cache root, **registered** via `git worktree list` for the **same repo** as `working_directory`, and not the original repo root. Unmanaged / unregistered / cross-repo paths → `GROK_MCP_WORKTREE_INVALID`. |
 | **Continue, worktree path missing** + resolved mode **write_worktree** | **Fail closed** → `GROK_MCP_WORKTREE_MISSING`. Do **not** fall back to original cwd for writes. |
 | **Continue, worktree missing** + explicit `mode=read_only` | Proceed read_only with `--cwd working_directory`. |
 | **Continue, worktree missing** + `allow_missing_worktree=true` + **no** explicit `mode=write_worktree` | **Downgrade** to read_only; `warnings: ["MODE_DOWNGRADED_MISSING_WORKTREE"]`; cwd=`working_directory`. |
 | **Continue** + explicit `mode=write_worktree` + `allow_missing_worktree=true` | **`GROK_MCP_INVALID_ARGS`** — conflicting flags (never silent downgrade when write was requested). |
-| **Continue, session unknown to MCP store** | Write mode without store entry and without caller `worktree_path` → `GROK_MCP_SESSION_NOT_FOUND`. read_only or `allow_unmapped_session=true` may attempt `grok -r` with `--cwd working_directory`. |
+| **Continue, optional caller `worktree_path`** | Must **exactly match** stored path (realpath); mismatch → `GROK_MCP_WORKTREE_INVALID`. |
+| **Continue, session unknown to MCP store** | Write mode without store entry → `GROK_MCP_SESSION_NOT_FOUND` (unmapped write sessions are rejected). read_only or `allow_unmapped_session=true` may attempt `grok -r` with `--cwd working_directory`. |
 | **Concurrent runs same repo** | Allowed; distinct worktree names/paths. Session store uses file lock + atomic write. |
 | **Cancel after worktree create** | Kill process group; worktree path already known — keep unless `keep_worktree=false` on success path only; orphans eligible for TTL GC. |
 | **`keep_worktree`** | Single param (default `true`). `false` → cleanup after **successful** result only. **No** `cleanup_worktree` alias. |
@@ -401,7 +416,7 @@ Grok’s `workspace` sandbox grants **write access to process CWD** (+ `~/.grok/
 | Trigger | Action |
 |---------|--------|
 | `keep_worktree: false` after success | Remove via Grok id or `git worktree remove` |
-| TTL (default **72h** since `last_used_at`) | GC on server start + after tool calls; **never GC sessions with `running=true`** |
+| TTL (default **72h** since `last_used_at`) | GC on **server start only** (not after tool calls); **never GC sessions with `running=true`**; only remove validated managed worktrees (absolute realpath under managed cache root, registered via `git worktree list`, `managed === true`) |
 | Process exit | Default: keep; `GROK_MCP_CLEANUP_ON_EXIT=1` best-effort remove process-created trees |
 | Manual | README: `grok worktree list`, `grok worktree rm <id>`, `grok worktree gc --max-age 72h` |
 

@@ -164,7 +164,7 @@ Never passes `-w` on continue. Missing worktree → `GROK_MCP_WORKTREE_MISSING` 
 
 ### Worktree GC
 
-TTL GC (server start / after calls) **only removes validated managed worktrees**:
+TTL GC runs **at server start only** (not after tool calls) and **only removes validated managed worktrees**:
 
 - Path must be absolute, realpath’d, **strictly under** `~/.cache/codex-grok-mcp/worktrees` (or `GROK_MCP_CACHE_DIR`)
 - Must not be the original repo root
