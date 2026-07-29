@@ -19,12 +19,19 @@ export const PermissionModeSchema = z.enum([
   "plan",
 ]);
 
+/** Canonical Grok CLI --reasoning-effort levels. */
+export const REASONING_EFFORT_LEVELS = ["low", "medium", "high"] as const;
+export const ReasoningEffortSchema = z
+  .enum(REASONING_EFFORT_LEVELS)
+  .describe("Grok reasoning effort: low | medium | high (passed as --reasoning-effort).");
+
 export const BaseToolInputSchema = z.object({
   prompt: z.string().min(1),
   working_directory: WorkingDirectorySchema,
   timeout_ms: z.number().int().positive().optional(),
   model: z.string().optional(),
   max_turns: z.number().int().positive().optional(),
+  reasoning_effort: ReasoningEffortSchema.optional(),
   test_command: z.string().optional(),
   test_timeout_ms: z.number().int().positive().optional(),
   fail_on_test_failure: z.boolean().optional().default(false),
@@ -90,6 +97,7 @@ export const ContinueInputSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
   model: z.string().optional(),
   max_turns: z.number().int().positive().optional(),
+  reasoning_effort: ReasoningEffortSchema.optional(),
   test_command: z.string().optional(),
   test_timeout_ms: z.number().int().positive().optional(),
   fail_on_test_failure: z.boolean().optional().default(false),
