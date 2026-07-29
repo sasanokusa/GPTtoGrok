@@ -86,4 +86,91 @@ describe("SessionStore", () => {
     expect(after?.created_at).toBe(createdAt);
     expect(after?.tool).toBe("grok_continue");
   });
+
+  it("gc does not hold the lock while removeWorktree runs", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cgm-ss-"));
+    tmpDirs.push(dir);
+    const file = path.join(dir, "sessions.json");
+    const lockPath = `${file}.lock`;
+    const store = new SessionStore(file, 10);
+
+    const old = new Date(Date.now() - 48 * 3600_000).toISOString();
+    await store.addPending({
+      run_id: "run-old",
+      worktree_path: "/cache/wt/old",
+      worktree_name: "old",
+      repo_root: "/repo",
+      created_at: old,
+    });
+
+    let sawLockAbsent = false;
+    let nestedGetOk = false;
+    const removed: string[] = [];
+
+    const n = await store.gc(1, async (entry) => {
+      // Lock must be released while the removal callback runs.
+      sawLockAbsent = !fs.existsSync(lockPath);
+      // Nested store ops must be able to acquire the lock.
+      await store.get("nonexistent");
+      nestedGetOk = true;
+      const pathHint =
+        "worktree_path" in entry && entry.worktree_path
+          ? entry.worktree_path
+          : "unknown";
+      removed.push(pathHint);
+    });
+
+    expect(sawLockAbsent).toBe(true);
+    expect(nestedGetOk).toBe(true);
+    expect(n).toBe(1);
+    expect(removed).toEqual(["/cache/wt/old"]);
+    const still = await store.listPending();
+    expect(still).toHaveLength(0);
+  });
+
+  it("gc does not remove entries that became running between snapshot and re-apply", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cgm-ss-"));
+    tmpDirs.push(dir);
+    const store = new SessionStore(path.join(dir, "sessions.json"), 10);
+
+    const old = new Date(Date.now() - 48 * 3600_000).toISOString();
+    await store.upsert("s-stale", {
+      mode: "write_worktree",
+      repo_root: "/repo",
+      original_cwd: "/repo",
+      worktree_path: "/cache/wt/s-stale",
+      managed: true,
+      created_at: old,
+      last_used_at: old,
+      tool: "grok_implement",
+    });
+    await store.addPending({
+      run_id: "run-stale",
+      worktree_path: "/cache/wt/run-stale",
+      worktree_name: "run-stale",
+      repo_root: "/repo",
+      created_at: old,
+    });
+
+    // During remove callback (unlocked), mark both as running so re-apply must keep them.
+    const n = await store.gc(1, async (entry) => {
+      if ("run_id" in entry) {
+        store.markRunning(entry.run_id);
+      } else if ("session_id" in entry && entry.session_id) {
+        store.markRunning(entry.session_id);
+      } else {
+        store.markRunning("s-stale");
+      }
+    });
+
+    // Removal callbacks succeeded but re-apply must skip running entries.
+    expect(n).toBe(0);
+    const rec = await store.get("s-stale");
+    expect(rec?.worktree_path).toBe("/cache/wt/s-stale");
+    const pending = await store.listPending();
+    expect(pending.map((p) => p.run_id)).toContain("run-stale");
+
+    store.markDone("s-stale");
+    store.markDone("run-stale");
+  });
 });

@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { BaseToolInputSchema } from "../types.js";
+import { AnalyzeInputSchema } from "../types.js";
 import type { ToolContext } from "./common.js";
-import { runTool, toolErrorToMcp } from "./common.js";
+import { parseToolInput, runTool, toolErrorToMcp } from "./common.js";
 
 export function registerAnalyze(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
@@ -9,8 +9,8 @@ export function registerAnalyze(server: McpServer, ctx: ToolContext): void {
     {
       title: "Grok Analyze (read-only)",
       description:
-        "Read-only codebase analysis via Grok Build headless CLI. Does not create a worktree. Requires absolute working_directory. Codex must set tool_timeout_sec >= 2400 on this MCP server.",
-      inputSchema: BaseToolInputSchema,
+        "Read-only codebase analysis via Grok Build headless CLI. Does not create a worktree. Requires absolute working_directory. Codex must set tool_timeout_sec >= 2400 on this MCP server. Does not accept test_command (read_only); permission_mode limited to dontAsk|plan; sandbox limited to read-only.",
+      inputSchema: AnalyzeInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -19,7 +19,7 @@ export function registerAnalyze(server: McpServer, ctx: ToolContext): void {
     },
     async (args, extra) => {
       try {
-        const input = BaseToolInputSchema.parse(args);
+        const input = parseToolInput(AnalyzeInputSchema, args);
         const result = await runTool(ctx, {
           tool: "grok_analyze",
           prompt: input.prompt,
@@ -29,9 +29,6 @@ export function registerAnalyze(server: McpServer, ctx: ToolContext): void {
           model: input.model,
           maxTurns: input.max_turns,
           reasoningEffort: input.reasoning_effort,
-          testCommand: input.test_command,
-          testTimeoutMs: input.test_timeout_ms,
-          failOnTestFailure: input.fail_on_test_failure,
           includeThoughts: input.include_thoughts,
           verbatim: input.verbatim,
           rules: input.rules,

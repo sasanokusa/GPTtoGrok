@@ -10,6 +10,9 @@ const emptyStore = (): SessionStoreData => ({
   sessions: {},
 });
 
+const LOCK_STALE_MS = 10_000;
+const LOCK_HEARTBEAT_MS = 2_000;
+
 export class SessionStore {
   private readonly filePath: string;
   private readonly lockPath: string;
@@ -81,64 +84,109 @@ export class SessionStore {
     return this.withLock((data) => [...data.pending_worktrees]);
   }
 
+  /**
+   * GC stale pending worktrees and sessions.
+   *
+   * Slow work (removeWorktree / git) runs **outside** the file lock so another
+   * process cannot treat a long GC as a stale lock and corrupt sessions.json.
+   * Snapshot candidates under the lock, remove unlocked, then re-lock and apply
+   * only for entries that are still present and still not in `this.running`.
+   */
   async gc(
     ttlHours: number,
     removeWorktree: (p: PendingWorktree | SessionRecord & { session_id?: string }) => Promise<void>,
   ): Promise<number> {
     const cutoff = Date.now() - ttlHours * 3600_000;
-    let removed = 0;
-    await this.withLock(async (data) => {
-      // pending orphans
-      const keepPending: PendingWorktree[] = [];
+
+    type PendingCandidate = { kind: "pending"; entry: PendingWorktree };
+    type SessionCandidate = {
+      kind: "session";
+      id: string;
+      entry: SessionRecord;
+    };
+    type Candidate = PendingCandidate | SessionCandidate;
+
+    const candidates: Candidate[] = await this.withLock((data) => {
+      const out: Candidate[] = [];
       for (const p of data.pending_worktrees) {
-        if (this.running.has(p.run_id)) {
-          keepPending.push(p);
-          continue;
-        }
+        if (this.running.has(p.run_id)) continue;
         const t = Date.parse(p.created_at);
         if (!Number.isNaN(t) && t < cutoff) {
-          try {
-            await removeWorktree(p);
-            removed++;
-          } catch (err) {
-            logger.warn("Failed to GC pending worktree", {
-              path: p.worktree_path,
-              err: String(err),
-            });
-            keepPending.push(p);
-          }
-        } else {
-          keepPending.push(p);
+          out.push({ kind: "pending", entry: p });
         }
       }
-      data.pending_worktrees = keepPending;
-
-      // old sessions
-      const next: Record<string, SessionRecord> = {};
       for (const [id, rec] of Object.entries(data.sessions)) {
-        if (this.running.has(id)) {
-          next[id] = rec;
-          continue;
-        }
+        if (this.running.has(id)) continue;
         const t = Date.parse(rec.last_used_at);
         if (!Number.isNaN(t) && t < cutoff) {
-          try {
-            await removeWorktree({ ...rec, session_id: id });
-            removed++;
-          } catch (err) {
-            logger.warn("Failed to GC session worktree", {
-              session_id: id,
-              err: String(err),
-            });
-            next[id] = rec;
-          }
-        } else {
-          next[id] = rec;
+          out.push({ kind: "session", id, entry: rec });
         }
       }
-      data.sessions = next;
+      return out;
+    });
+
+    const succeededPending = new Set<string>();
+    const succeededSessions = new Set<string>();
+
+    for (const c of candidates) {
+      // Re-check running before slow work (may have started after snapshot).
+      if (c.kind === "pending") {
+        if (this.running.has(c.entry.run_id)) continue;
+        try {
+          await removeWorktree(c.entry);
+          succeededPending.add(c.entry.run_id);
+        } catch (err) {
+          logger.warn("Failed to GC pending worktree", {
+            path: c.entry.worktree_path,
+            err: String(err),
+          });
+        }
+      } else {
+        if (this.running.has(c.id)) continue;
+        try {
+          await removeWorktree({ ...c.entry, session_id: c.id });
+          succeededSessions.add(c.id);
+        } catch (err) {
+          logger.warn("Failed to GC session worktree", {
+            session_id: c.id,
+            err: String(err),
+          });
+        }
+      }
+    }
+
+    if (succeededPending.size === 0 && succeededSessions.size === 0) {
+      return 0;
+    }
+
+    let removed = 0;
+    await this.withLock((data) => {
+      // Re-read current data (withLock already did); only drop entries that are
+      // still present and still not running — never overwrite with a stale snapshot.
+      if (succeededPending.size) {
+        const nextPending: PendingWorktree[] = [];
+        for (const p of data.pending_worktrees) {
+          if (succeededPending.has(p.run_id) && !this.running.has(p.run_id)) {
+            removed++;
+            continue;
+          }
+          nextPending.push(p);
+        }
+        data.pending_worktrees = nextPending;
+      }
+
+      if (succeededSessions.size) {
+        for (const id of succeededSessions) {
+          if (data.sessions[id] && !this.running.has(id)) {
+            delete data.sessions[id];
+            removed++;
+          }
+        }
+      }
+
       this.prune(data);
     });
+
     return removed;
   }
 
@@ -194,12 +242,24 @@ export class SessionStore {
 
   private async acquireLock(): Promise<() => Promise<void>> {
     const start = Date.now();
-    const staleMs = 10_000;
     while (true) {
       try {
         const fd = fs.openSync(this.lockPath, "wx");
         fs.writeSync(fd, `${process.pid}\n${Date.now()}\n`);
+        // Refresh mtime while held so slow critical sections are not declared stale.
+        const heartbeat = setInterval(() => {
+          try {
+            const now = new Date();
+            fs.utimesSync(this.lockPath, now, now);
+          } catch {
+            /* lock may have been released or stolen */
+          }
+        }, LOCK_HEARTBEAT_MS);
+        // Don't keep the process alive solely for the heartbeat.
+        if (typeof heartbeat.unref === "function") heartbeat.unref();
+
         return async () => {
+          clearInterval(heartbeat);
           try {
             fs.closeSync(fd);
           } catch {
@@ -217,14 +277,14 @@ export class SessionStore {
         // stale lock?
         try {
           const stat = await fsPromises.stat(this.lockPath);
-          if (Date.now() - stat.mtimeMs > staleMs) {
+          if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
             await fsPromises.unlink(this.lockPath);
             continue;
           }
         } catch {
           /* retry */
         }
-        if (Date.now() - start > staleMs * 2) {
+        if (Date.now() - start > LOCK_STALE_MS * 2) {
           throw new Error(`Timeout acquiring session store lock: ${this.lockPath}`);
         }
         await new Promise((r) => setTimeout(r, 25));

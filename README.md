@@ -79,6 +79,40 @@ Without `tool_timeout_sec`, almost every real implement/debug call will be cance
 
 Full example: [`examples/codex-config.toml`](examples/codex-config.toml).
 
+## Claude Code configuration
+
+This server works from **Claude Code** as well as Codex. Register it once:
+
+```bash
+# User scope: available in every project on this machine
+claude mcp add codex-grok -s user -- node /ABSOLUTE/PATH/TO/GPTtoGrok/dist/index.js
+
+# Or local scope: only the current project
+# claude mcp add codex-grok -s local -- node /ABSOLUTE/PATH/TO/GPTtoGrok/dist/index.js
+```
+
+Claude Code defaults for MCP timeouts are far below `grok_implement`'s 30-minute server default. Raise them to match the Codex guidance:
+
+| Variable | Role | Recommended |
+|----------|------|-------------|
+| `MCP_TOOL_TIMEOUT` | Per tool-call deadline (ms) | `2400000` (40 minutes) |
+| `MCP_TIMEOUT` | Server startup / connect deadline (ms) | at least `30000` |
+
+Example:
+
+```bash
+export MCP_TOOL_TIMEOUT=2400000
+export MCP_TIMEOUT=30000
+```
+
+Without raising `MCP_TOOL_TIMEOUT`, long implement/debug runs are cut off by the host before Grok finishes.
+
+Env snippet: [`examples/claude-code.env.example`](examples/claude-code.env.example).
+
+### Host restarts after rebuild (all hosts)
+
+The MCP server process is **spawned once** when the host connects. After `npm run build`, you must **restart the host** (or reconnect/reload the MCP server) before the new `dist/` code takes effect. Editing source or rebuilding alone does not hot-reload a running server.
+
 ## Isolation model (write tools)
 
 Isolation is **best-effort**, not a hard OS guarantee.
@@ -127,6 +161,16 @@ The server:
 - Passes Grok `--deny Read(...)` rules for common secret globs
 
 This is **best-effort DLP**, not perfect secret scanning.
+
+## Security note: `test_command` runs outside Grok's sandbox
+
+When the effective mode is `write_worktree`, optional `test_command` is executed by the MCP server on the **host** after Grok finishes:
+
+- Spawn: `/bin/sh -c <test_command>` (non-login shell; profile is not sourced)
+- **cwd** is the worktree (or effective cwd), which Grok may have modified arbitrarily
+- Runs with a scrubbed environment on the host — **not** under Grok’s `--sandbox workspace`
+
+A generated `package.json`, test file, or script in the worktree is therefore executed with the user’s host `PATH` and privileges. **Only pass `test_command` for prompts and repositories you trust.** It is rejected entirely when the effective mode is `read_only` (`GROK_MCP_INVALID_ARGS`).
 
 ## Environment variables
 
@@ -185,11 +229,29 @@ npm run dev       # stdio server (for manual MCP attach)
 Design: [`docs/design-codex-grok-mcp.md`](docs/design-codex-grok-mcp.md)  
 Agent notes: [`AGENTS.md`](AGENTS.md)
 
+## Error shapes
+
+Tool failures returned from our handlers use a frozen JSON envelope:
+
+```json
+{
+  "error_version": 1,
+  "code": "GROK_MCP_INVALID_ARGS",
+  "message": "…",
+  "details": {}
+}
+```
+
+Including schema failures from the handler’s explicit Zod `.parse` (converted to `GROK_MCP_INVALID_ARGS`). Path / mode / runtime errors use the same shape.
+
+**Residual case:** the MCP SDK may validate the registered `inputSchema` *before* the handler runs. If the SDK rejects first, the host may see a raw JSON-RPC `-32602 Input validation error: …` instead of the envelope. That path is outside this server’s control.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| Tool cancelled after ~60s | Set `tool_timeout_sec = 2400` in Codex MCP config |
+| Tool cancelled after ~60s | Set `tool_timeout_sec = 2400` in Codex MCP config, **or** `MCP_TOOL_TIMEOUT=2400000` for Claude Code |
+| Changes after `npm run build` not visible | Restart the host / reconnect the MCP server (process is not hot-reloaded) |
 | `GROK_MCP_GROK_NOT_FOUND` | Install Grok CLI; set `GROK_MCP_GROK_BIN` |
 | `GROK_MCP_NOT_A_GIT_REPO` | Init git, or use `grok_analyze` (read-only) |
 | `GROK_MCP_PATH_NOT_ALLOWED` | Expand `GROK_MCP_ALLOWED_ROOTS` |
@@ -197,6 +259,7 @@ Agent notes: [`AGENTS.md`](AGENTS.md)
 | Resume fails | Pass exact `session_id` from prior result; write continue needs stored **managed** same-repo registered worktree |
 | `test_command` rejected | Only valid in effective `write_worktree`; omit for analyze/review/read_only |
 | `permission_mode` / `sandbox` rejected | read_only forbids unsafe overrides (`bypassPermissions`, `off`, `workspace`, …) |
+| Raw `-32602` validation error | SDK rejected args before our handler; fix the field named in the message (envelope applies only after the handler runs) |
 
 ## License
 

@@ -648,9 +648,10 @@ Run in `effective_cwd` (worktree or original). Output must be **`git apply`-frie
 
 #### Tests strategy
 
-- `test_command` is **schema-visible** on shared inputs (and `grok_continue`) but **rejected** when the **effective** mode is `read_only` (`GROK_MCP_INVALID_ARGS`). It is allowed only when the effective mode is `write_worktree` (isolated worktree).
-- Optional `test_command`; when accepted, run after Grok in `effective_cwd` with `stdio` pipes, scrubbed env, `timeout_ms` (default 300s).
-- Shell: `['/bin/sh', '-lc', test_command]` — write_worktree isolation only; document that commands can still `cd` elsewhere (no full jail).
+- `test_command` is **schema-visible** on shared write-capable inputs (`grok_implement`, `grok_review`, `grok_debug`, `grok_continue`) but **rejected** when the **effective** mode is `read_only` (`GROK_MCP_INVALID_ARGS`). It is allowed only when the effective mode is `write_worktree` (isolated worktree). `grok_analyze` omits the field from its schema entirely (always read_only).
+- Optional `test_command`; when accepted, run **after Grok** in `effective_cwd` with `stdio` pipes, scrubbed env, `timeout_ms` (default 300s).
+- Shell: `['/bin/sh', '-c', test_command]` (non-login; do **not** use `-lc` — avoids sourcing the user profile).
+- **Sandbox escape (documented threat):** `test_command` runs on the **host outside Grok’s sandbox**. Grok may have written arbitrary files into the worktree; the host shell then executes the command with the user’s PATH. Only pass `test_command` for prompts and repositories you trust. Commands can still `cd` elsewhere (no full jail).
 - **Tool success**: if Grok succeeded, tool remains success even if tests fail; `tests.exit_code != 0`.  
   If `fail_on_test_failure: true`, then `isError: true` with code `GROK_MCP_TESTS_FAILED`.
 - No `test_command` → `tests: { ran: false }`.
@@ -1072,7 +1073,7 @@ Session store as above. Optional config file `~/.config/codex-grok-mcp/config.js
 | Prompt injection to cat secrets | Medium | `--deny Read` secret globs; scaffolding; output redaction |
 | MCP stdout corruption | High | Logs only on stderr |
 | Runaway processes | Medium | Timeout from enqueue; process group kill |
-| `test_command` injection | Medium | Rejected in `read_only`; isolated `write_worktree` only; scrubbed env; optional fail flag |
+| `test_command` injection / sandbox escape | Medium | Rejected in `read_only`; write_worktree only; runs on **host** via `/bin/sh -c` **outside** Grok sandbox after worktree mutation — trust boundary; scrubbed env; non-login shell; optional fail flag; documented in README |
 | Broad default allowedRoots=$HOME | Medium | Documented tradeoff; README recommends tightening |
 
 ### Path validation algorithm (v1)

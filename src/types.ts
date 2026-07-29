@@ -20,6 +20,31 @@ export const PermissionModeSchema = z.enum([
   "plan",
 ]);
 
+/** Permission modes that survive read_only (unsafe values are rejected at runtime). */
+export const ReadOnlyPermissionModeSchema = z.enum(["dontAsk", "plan"]);
+
+/**
+ * Sandbox profiles that permit mutation / escape in read_only.
+ * Single source of truth: `buildModeFlags` rejects these at runtime and
+ * {@link ReadOnlySandboxSchema} rejects them at parse time.
+ */
+export const UNSAFE_READ_ONLY_SANDBOXES = new Set(["off", "workspace"]);
+
+/**
+ * Sandbox values that survive read_only. `grok --sandbox <PROFILE>` is free-form,
+ * so any profile is allowed except the ones the runtime rejects — do not enumerate,
+ * or a future Grok profile becomes unusable here.
+ */
+export const ReadOnlySandboxSchema = z
+  .string()
+  .min(1)
+  .refine((s) => !UNSAFE_READ_ONLY_SANDBOXES.has(s), {
+    message: `sandbox must not be one of: ${[...UNSAFE_READ_ONLY_SANDBOXES].join(", ")} (read_only)`,
+  })
+  .describe(
+    'Grok sandbox profile (--sandbox). Defaults to "read-only"; "off" and "workspace" are rejected in read_only mode.',
+  );
+
 /** Canonical Grok CLI --reasoning-effort levels. */
 export const REASONING_EFFORT_LEVELS = [
   "none",
@@ -73,6 +98,24 @@ export const BaseToolInputSchema = z.object({
   allow_web: z.boolean().optional().default(false),
   allow_subagents: z.boolean().optional().default(false),
 });
+
+/**
+ * Schema for grok_analyze (always read_only): omit test fields that are hard-rejected
+ * and narrow permission_mode / sandbox to values that survive read_only.
+ * Runtime guards remain as defence in depth.
+ */
+export const AnalyzeInputSchema = BaseToolInputSchema.omit({
+  test_command: true,
+  test_timeout_ms: true,
+  fail_on_test_failure: true,
+})
+  .extend({
+    permission_mode: ReadOnlyPermissionModeSchema.optional(),
+    sandbox: ReadOnlySandboxSchema.optional(),
+  })
+  // Reject unknown keys (e.g. test_command) at parse time — matches JSON Schema
+  // additionalProperties: false advertised via tools/list.
+  .strict();
 
 export const ImplementInputSchema = BaseToolInputSchema.extend({
   worktree_ref: z.string().optional(),
@@ -142,6 +185,7 @@ export const ContinueInputSchema = z.object({
 });
 
 export type BaseToolInput = z.infer<typeof BaseToolInputSchema>;
+export type AnalyzeInput = z.infer<typeof AnalyzeInputSchema>;
 export type ImplementInput = z.infer<typeof ImplementInputSchema>;
 export type ReviewInput = z.infer<typeof ReviewInputSchema>;
 export type DebugInput = z.infer<typeof DebugInputSchema>;

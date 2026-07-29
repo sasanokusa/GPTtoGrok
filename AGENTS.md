@@ -59,6 +59,7 @@ npm run dev   # run stdio server
 - [ ] Path guard still rejects traversal / relative paths
 - [ ] Isolation recipe unchanged unless design doc updated
 - [ ] Both shell tool IDs still denied for read_only
+- [ ] Do not widen `test_command` execution (host `/bin/sh -c` outside Grok sandbox; keep rejected in read_only; no login shell)
 
 ## Out of scope
 

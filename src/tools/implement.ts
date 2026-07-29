@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ImplementInputSchema } from "../types.js";
 import type { ToolContext } from "./common.js";
-import { runTool, toolErrorToMcp } from "./common.js";
+import { parseToolInput, runTool, toolErrorToMcp } from "./common.js";
 
 export function registerImplement(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
@@ -19,7 +19,7 @@ export function registerImplement(server: McpServer, ctx: ToolContext): void {
     },
     async (args, extra) => {
       try {
-        const input = ImplementInputSchema.parse(args);
+        const input = parseToolInput(ImplementInputSchema, args);
         const result = await runTool(ctx, {
           tool: "grok_implement",
           prompt: input.prompt,

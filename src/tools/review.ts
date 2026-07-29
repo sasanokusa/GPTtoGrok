@@ -4,7 +4,7 @@ import { getDiffVsRef } from "../git.js";
 import { logger } from "../log.js";
 import { ReviewInputSchema } from "../types.js";
 import type { ToolContext } from "./common.js";
-import { runTool, toolErrorToMcp } from "./common.js";
+import { parseToolInput, runTool, toolErrorToMcp } from "./common.js";
 
 /**
  * True when a diff-collection failure must abort the review (bad/unsafe base_ref)
@@ -20,7 +20,7 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
     {
       title: "Grok Review (read-only by default)",
       description:
-        "Code review via Grok Build. By default injects a redacted git diff vs base_ref (default HEAD) into the prompt. read_only by default. Requires absolute working_directory.",
+        "Code review via Grok Build. By default injects a redacted git diff vs base_ref (default HEAD) into the prompt. read_only by default. Requires absolute working_directory. When effective mode is read_only, test_command is rejected and unsafe permission_mode/sandbox values (bypassPermissions, acceptEdits, auto, default; sandbox off|workspace) are rejected.",
       inputSchema: ReviewInputSchema,
       annotations: {
         readOnlyHint: true,
@@ -30,7 +30,7 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
     },
     async (args, extra) => {
       try {
-        const input = ReviewInputSchema.parse(args);
+        const input = parseToolInput(ReviewInputSchema, args);
         let prompt = input.prompt;
         const extraWarnings: string[] = [];
         if (input.inject_diff !== false) {

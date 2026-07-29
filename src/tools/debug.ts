@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { DebugInputSchema } from "../types.js";
 import type { ToolContext } from "./common.js";
-import { runTool, toolErrorToMcp } from "./common.js";
+import { parseToolInput, runTool, toolErrorToMcp } from "./common.js";
 
 export function registerDebug(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
@@ -9,7 +9,7 @@ export function registerDebug(server: McpServer, ctx: ToolContext): void {
     {
       title: "Grok Debug",
       description:
-        "Debug and optionally fix issues via Grok Build. Defaults to write_worktree (isolated). Can pass mode=read_only for diagnosis only. Returns worktree_path/diff when writing. Absolute working_directory required.",
+        "Debug and optionally fix issues via Grok Build. Defaults to write_worktree (isolated). Can pass mode=read_only for diagnosis only. Returns worktree_path/diff when writing. Absolute working_directory required. When effective mode is read_only, test_command is rejected and unsafe permission_mode/sandbox values (bypassPermissions, acceptEdits, auto, default; sandbox off|workspace) are rejected.",
       inputSchema: DebugInputSchema,
       annotations: {
         readOnlyHint: false,
@@ -19,7 +19,7 @@ export function registerDebug(server: McpServer, ctx: ToolContext): void {
     },
     async (args, extra) => {
       try {
-        const input = DebugInputSchema.parse(args);
+        const input = parseToolInput(DebugInputSchema, args);
         const result = await runTool(ctx, {
           tool: "grok_debug",
           prompt: input.prompt,

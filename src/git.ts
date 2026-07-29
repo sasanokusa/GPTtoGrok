@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { GrokMcpError } from "./errors.js";
+import { scrubEnv } from "./grok-runner.js";
 import type { RedactConfig } from "./redact.js";
 import { filterSecretPaths, isSecretPath, redactText } from "./redact.js";
 
@@ -20,7 +21,8 @@ export async function runGit(
     const child = spawn("git", args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
+      // Scrub secrets from the child env (same policy as Grok / test_command).
+      env: { ...scrubEnv(), GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
     });
     let stdout = "";
     let stderr = "";
@@ -234,8 +236,52 @@ export function filterSecretDiffHunks(
 }
 
 /**
+ * Best-effort insertions/deletions from a `git diff --stat` file row.
+ * Uses the histogram bar after `|`; when scaled, distributes the numeric total
+ * proportionally across `+`/`-` characters.
+ */
+function countsFromStatRow(line: string): { insertions: number; deletions: number } {
+  const pipe = line.lastIndexOf("|");
+  if (pipe < 0) return { insertions: 0, deletions: 0 };
+  const right = line.slice(pipe + 1).trim();
+  if (/^Bin\b/i.test(right)) return { insertions: 0, deletions: 0 };
+  const m = right.match(/^(\d+)\s*(.*)$/);
+  if (!m) return { insertions: 0, deletions: 0 };
+  const total = Number.parseInt(m[1]!, 10);
+  const bar = m[2] ?? "";
+  const plus = (bar.match(/\+/g) ?? []).length;
+  const minus = (bar.match(/-/g) ?? []).length;
+  if (plus + minus === 0) return { insertions: 0, deletions: 0 };
+  if (plus + minus === total || total === 0) {
+    return { insertions: plus, deletions: minus };
+  }
+  // Scaled bar: apportion the numeric total by bar ratio.
+  const ratio = total / (plus + minus);
+  const insertions = Math.round(plus * ratio);
+  return { insertions, deletions: total - insertions };
+}
+
+function formatStatSummary(
+  fileRows: number,
+  insertions: number,
+  deletions: number,
+  secretOmitted: boolean,
+): string {
+  let summary = ` ${fileRows} file${fileRows === 1 ? "" : "s"} changed`;
+  if (insertions > 0) {
+    summary += `, ${insertions} insertion${insertions === 1 ? "" : "s"}(+)`;
+  }
+  if (deletions > 0) {
+    summary += `, ${deletions} deletion${deletions === 1 ? "" : "s"}(-)`;
+  }
+  if (secretOmitted) summary += " (secret paths omitted)";
+  return summary;
+}
+
+/**
  * Drop secret-path rows from `git diff --stat` output.
- * Summary line is recomputed from remaining file rows when possible.
+ * Summary line keeps insertion/deletion counts from retained rows; the
+ * `(secret paths omitted)` qualifier is only appended when something was removed.
  */
 export function filterSecretStatLines(
   stat: string,
@@ -246,11 +292,15 @@ export function filterSecretStatLines(
   const kept: string[] = [];
   let redactedAny = false;
   let fileRows = 0;
+  let insertions = 0;
+  let deletions = 0;
+  let originalSummary: string | null = null;
 
   for (const line of lines) {
     // Summary: " N files changed, ..."
     if (/^\s*\d+\s+files? changed/.test(line)) {
-      continue; // recompute below
+      originalSummary = line;
+      continue; // recompute or restore below
     }
     // File row: " path/to/file | 12 +++---" (leading space optional)
     const m = line.match(/^\s*(.+?)\s+\|\s+/);
@@ -262,17 +312,23 @@ export function filterSecretStatLines(
       }
       kept.push(line);
       fileRows += 1;
+      const c = countsFromStatRow(line);
+      insertions += c.insertions;
+      deletions += c.deletions;
       continue;
     }
     kept.push(line);
   }
 
-  // Drop trailing empty-only noise then add a simple summary if we had file rows
+  // Drop trailing empty-only noise then add a summary if we had file rows
   while (kept.length && kept[kept.length - 1] === "") kept.pop();
   if (fileRows > 0) {
-    kept.push(
-      ` ${fileRows} file${fileRows === 1 ? "" : "s"} changed (secret paths omitted)`,
-    );
+    if (!redactedAny && originalSummary !== null) {
+      // Nothing removed: keep git's original summary (with its counts).
+      kept.push(originalSummary);
+    } else {
+      kept.push(formatStatSummary(fileRows, insertions, deletions, redactedAny));
+    }
   }
   let out = kept.join("\n");
   if (out && stat.endsWith("\n")) out += "\n";

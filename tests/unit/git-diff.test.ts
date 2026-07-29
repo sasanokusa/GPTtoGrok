@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { GrokMcpError } from "../../src/errors.js";
 import {
   assembleDiff,
+  filterSecretStatLines,
   getDiffVsRef,
   verifyBaseRef,
 } from "../../src/git.js";
@@ -185,6 +186,40 @@ describe("getDiffVsRef", () => {
     ).rejects.toMatchObject({
       code: "GROK_MCP_INVALID_ARGS",
     });
+  });
+});
+
+describe("filterSecretStatLines", () => {
+  it("keeps original summary counts when nothing is redacted", () => {
+    const stat = [
+      " normal.ts | 2 +-",
+      " extra.ts  | 1 +",
+      " 2 files changed, 2 insertions(+), 1 deletion(-)",
+      "",
+    ].join("\n");
+    const result = filterSecretStatLines(stat, secretCfg);
+    expect(result.redactedAny).toBe(false);
+    expect(result.stat).toContain("normal.ts");
+    expect(result.stat).toContain("extra.ts");
+    expect(result.stat).toContain("2 files changed, 2 insertions(+), 1 deletion(-)");
+    expect(result.stat).not.toContain("secret paths omitted");
+  });
+
+  it("recomputes counts and marks omission when secret paths are dropped", () => {
+    const stat = [
+      " normal.ts | 2 +-",
+      " .env      | 1 +",
+      " 2 files changed, 2 insertions(+), 1 deletion(-)",
+      "",
+    ].join("\n");
+    const result = filterSecretStatLines(stat, secretCfg);
+    expect(result.redactedAny).toBe(true);
+    expect(result.stat).toContain("normal.ts");
+    expect(result.stat).not.toContain(".env");
+    expect(result.stat).toMatch(/1 file changed/);
+    expect(result.stat).toMatch(/1 insertion\(\+\)/);
+    expect(result.stat).toMatch(/1 deletion\(-\)/);
+    expect(result.stat).toContain("(secret paths omitted)");
   });
 });
 

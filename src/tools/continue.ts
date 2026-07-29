@@ -5,7 +5,7 @@ import { getRepoRoot } from "../git.js";
 import { normalizeForCompare, resolveWorkingDirectory } from "../path-guard.js";
 import { ContinueInputSchema } from "../types.js";
 import type { ToolContext } from "./common.js";
-import { runTool, toolErrorToMcp } from "./common.js";
+import { parseToolInput, runTool, toolErrorToMcp } from "./common.js";
 import {
   assertServerManagedWorktree,
   pathExists,
@@ -28,7 +28,7 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
     },
     async (args, extra) => {
       try {
-        const input = ContinueInputSchema.parse(args);
+        const input = parseToolInput(ContinueInputSchema, args);
 
         if (input.mode === "write_worktree" && input.allow_missing_worktree) {
           throw new GrokMcpError(

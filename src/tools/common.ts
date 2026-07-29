@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
+import { ZodError, type z } from "zod";
 import type { ServerConfig } from "../config.js";
 import { DEFAULT_TIMEOUTS_MS, SECRET_READ_DENY_RULES } from "../config.js";
 import { GrokMcpError, isGrokMcpError } from "../errors.js";
@@ -31,12 +32,47 @@ import type {
   TestsResult,
   ToolName,
 } from "../types.js";
-import { rejectTestCommandInReadOnly } from "../types.js";
+import {
+  rejectTestCommandInReadOnly,
+  UNSAFE_READ_ONLY_SANDBOXES,
+} from "../types.js";
 import {
   createManagedWorktree,
   pathExists,
   removeWorktree,
 } from "../worktree.js";
+
+/**
+ * Parse tool args with a Zod schema, converting ZodError into the standard
+ * GrokMcpError envelope (error_version: 1) so hosts do not need a second shape.
+ * Note: the MCP SDK may still reject against the registered inputSchema before
+ * the handler runs; that residual -32602 path is outside our control.
+ */
+export function parseToolInput<T extends z.ZodTypeAny>(
+  schema: T,
+  args: unknown,
+): z.infer<T> {
+  try {
+    return schema.parse(args);
+  } catch (err) {
+    if (err instanceof ZodError) {
+      const parts = err.issues.map((issue) => {
+        const field = issue.path.length ? issue.path.join(".") : "(root)";
+        return `${field}: ${issue.message}`;
+      });
+      throw new GrokMcpError(
+        "GROK_MCP_INVALID_ARGS",
+        `Invalid tool arguments: ${parts.join("; ")}`,
+        {
+          fields: err.issues.map((issue) =>
+            issue.path.length ? issue.path.join(".") : "(root)",
+          ),
+        },
+      );
+    }
+    throw err;
+  }
+}
 
 export interface ToolContext {
   config: ServerConfig;
@@ -163,8 +199,6 @@ const UNSAFE_READ_ONLY_PERMISSION_MODES = new Set([
   "default",
 ]);
 
-/** Sandbox values that permit mutation / escape in read_only. */
-const UNSAFE_READ_ONLY_SANDBOXES = new Set(["off", "workspace"]);
 
 function clampTimeout(ms: number, max: number): number {
   return Math.min(Math.max(1, ms), max);
@@ -294,7 +328,10 @@ async function runTests(
   maxOutput: number,
 ): Promise<TestsResult> {
   return new Promise((resolve) => {
-    const child = spawn("/bin/sh", ["-lc", command], {
+    // Non-login shell: avoid sourcing the user profile (wider blast radius +
+    // non-reproducible PATH). test_command still runs on the host outside Grok's
+    // sandbox — see README / design doc threat model.
+    const child = spawn("/bin/sh", ["-c", command], {
       cwd,
       env: scrubEnv(),
       stdio: ["ignore", "pipe", "pipe"],
