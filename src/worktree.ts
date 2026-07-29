@@ -4,7 +4,11 @@ import path from "node:path";
 import { GrokMcpError } from "./errors.js";
 import { getRepoRoot, runGit } from "./git.js";
 import { logger } from "./log.js";
-import { isPathInside } from "./path-guard.js";
+import {
+  isAbsolutePath,
+  isPathInside,
+  normalizeForCompare,
+} from "./path-guard.js";
 
 export interface CreateWorktreeOpts {
   repoRoot: string;
@@ -27,6 +31,212 @@ function repoHash(repoRoot: string): string {
 
 function randomHex(n = 8): string {
   return crypto.randomBytes(Math.ceil(n / 2)).toString("hex").slice(0, n);
+}
+
+/** True if `child` is strictly inside `parent` (not equal). */
+export function isStrictlyUnder(child: string, parent: string): boolean {
+  const c = normalizeForCompare(child);
+  const p = normalizeForCompare(parent);
+  if (c === p) return false;
+  const prefix = p.endsWith(path.sep) ? p : p + path.sep;
+  return c.startsWith(prefix);
+}
+
+/**
+ * Resolve a worktree path: must be absolute, must exist, returns realpath.
+ */
+export async function resolveWorktreeRealpath(input: string): Promise<string> {
+  if (!input || typeof input !== "string") {
+    throw new GrokMcpError(
+      "GROK_MCP_WORKTREE_INVALID",
+      "worktree_path is required",
+    );
+  }
+  if (input.includes("\0")) {
+    throw new GrokMcpError(
+      "GROK_MCP_PATH_TRAVERSAL",
+      "worktree_path contains null bytes",
+    );
+  }
+  const trimmed = input.trim();
+  if (!isAbsolutePath(trimmed)) {
+    throw new GrokMcpError(
+      "GROK_MCP_INVALID_ARGS",
+      "worktree_path must be an absolute path (relative paths are rejected)",
+    );
+  }
+  const absolute = path.resolve(trimmed);
+  try {
+    const real = await fs.realpath(absolute);
+    const st = await fs.stat(real);
+    if (!st.isDirectory()) {
+      throw new GrokMcpError(
+        "GROK_MCP_WORKTREE_INVALID",
+        `worktree_path is not a directory: ${real}`,
+      );
+    }
+    return real;
+  } catch (err) {
+    if (err instanceof GrokMcpError) throw err;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      throw new GrokMcpError(
+        "GROK_MCP_WORKTREE_MISSING",
+        `worktree_path does not exist: ${absolute}`,
+      );
+    }
+    throw new GrokMcpError(
+      "GROK_MCP_WORKTREE_INVALID",
+      `Failed to resolve worktree_path: ${absolute}`,
+      { cause: String(err) },
+    );
+  }
+}
+
+/** Paths registered via `git worktree list --porcelain` for the given repo. */
+export async function listRegisteredWorktreePaths(
+  repoRoot: string,
+): Promise<string[]> {
+  const r = await runGit(["worktree", "list", "--porcelain"], repoRoot);
+  if (r.exitCode !== 0) {
+    return [];
+  }
+  const paths: string[] = [];
+  for (const line of r.stdout.split("\n")) {
+    if (!line.startsWith("worktree ")) continue;
+    const p = line.slice("worktree ".length).trim();
+    if (!p) continue;
+    try {
+      paths.push(await fs.realpath(p));
+    } catch {
+      paths.push(path.resolve(p));
+    }
+  }
+  return paths;
+}
+
+export async function isRegisteredWorktree(
+  repoRoot: string,
+  worktreeRealpath: string,
+): Promise<boolean> {
+  const registered = await listRegisteredWorktreePaths(repoRoot);
+  const target = normalizeForCompare(worktreeRealpath);
+  return registered.some((p) => normalizeForCompare(p) === target);
+}
+
+export interface AssertManagedWorktreeOpts {
+  worktreePath: string;
+  repoRoot: string;
+  worktreesRoot: string;
+  /** When false, skip existence/realpath of path (caller already resolved). Default true. */
+  alreadyResolved?: boolean;
+}
+
+/**
+ * Assert worktree is a server-managed path: absolute realpath, strictly under
+ * worktreesRoot, not the original repo root, and registered to that repo via
+ * `git worktree list`.
+ * Returns the resolved realpath.
+ */
+export async function assertServerManagedWorktree(
+  opts: AssertManagedWorktreeOpts,
+): Promise<string> {
+  const realWt = opts.alreadyResolved
+    ? opts.worktreePath
+    : await resolveWorktreeRealpath(opts.worktreePath);
+
+  let realRoot: string;
+  try {
+    realRoot = await fs.realpath(opts.repoRoot);
+  } catch {
+    realRoot = path.resolve(opts.repoRoot);
+  }
+
+  let realWorktreesRoot: string;
+  try {
+    await fs.mkdir(opts.worktreesRoot, { recursive: true });
+    realWorktreesRoot = await fs.realpath(opts.worktreesRoot);
+  } catch {
+    realWorktreesRoot = path.resolve(opts.worktreesRoot);
+  }
+
+  if (normalizeForCompare(realWt) === normalizeForCompare(realRoot)) {
+    throw new GrokMcpError(
+      "GROK_MCP_WORKTREE_INVALID",
+      "worktree_path must not be the original repository root",
+      { worktree_path: realWt, repo_root: realRoot },
+    );
+  }
+
+  if (!isStrictlyUnder(realWt, realWorktreesRoot)) {
+    throw new GrokMcpError(
+      "GROK_MCP_WORKTREE_INVALID",
+      "worktree_path is not under the server-managed worktrees root",
+      {
+        worktree_path: realWt,
+        worktrees_root: realWorktreesRoot,
+      },
+    );
+  }
+
+  const registered = await isRegisteredWorktree(realRoot, realWt);
+  if (!registered) {
+    throw new GrokMcpError(
+      "GROK_MCP_WORKTREE_INVALID",
+      "worktree_path is not registered via git worktree list for this repository",
+      { worktree_path: realWt, repo_root: realRoot },
+    );
+  }
+
+  return realWt;
+}
+
+/**
+ * Non-throwing safety check used by GC / removal. Returns false for any
+ * untrusted, unregistered, or outside-root path (never removes those).
+ */
+export async function isSafeManagedWorktreeForRemoval(
+  worktreePath: string | undefined,
+  repoRoot: string | undefined,
+  worktreesRoot: string,
+): Promise<{ safe: true; realPath: string; realRepo: string } | { safe: false }> {
+  if (!worktreePath || !repoRoot) return { safe: false };
+  try {
+    if (!isAbsolutePath(worktreePath) || !isAbsolutePath(repoRoot)) {
+      return { safe: false };
+    }
+    let realWt: string;
+    try {
+      realWt = await fs.realpath(worktreePath);
+    } catch {
+      return { safe: false };
+    }
+    let realRepo: string;
+    try {
+      realRepo = await fs.realpath(repoRoot);
+    } catch {
+      realRepo = path.resolve(repoRoot);
+    }
+    let realWorktreesRoot: string;
+    try {
+      realWorktreesRoot = await fs.realpath(path.resolve(worktreesRoot));
+    } catch {
+      // If worktrees root does not exist, nothing under it is safe to rm.
+      return { safe: false };
+    }
+    if (normalizeForCompare(realWt) === normalizeForCompare(realRepo)) {
+      return { safe: false };
+    }
+    if (!isStrictlyUnder(realWt, realWorktreesRoot)) {
+      return { safe: false };
+    }
+    if (!(await isRegisteredWorktree(realRepo, realWt))) {
+      return { safe: false };
+    }
+    return { safe: true, realPath: realWt, realRepo };
+  } catch {
+    return { safe: false };
+  }
 }
 
 export async function allocateWorktreeName(
@@ -121,26 +331,55 @@ export async function createManagedWorktree(
   );
 }
 
+/**
+ * Remove a managed worktree only if it is strictly under worktreesRoot and
+ * registered to the repo. Never recursively removes caller-controlled or
+ * unregistered paths (even if sessions.json is malicious).
+ */
 export async function removeWorktree(
   repoRoot: string,
   worktreePath: string,
+  worktreesRoot: string,
 ): Promise<void> {
+  const check = await isSafeManagedWorktreeForRemoval(
+    worktreePath,
+    repoRoot,
+    worktreesRoot,
+  );
+  if (!check.safe) {
+    logger.warn("Refusing to remove untrusted/unregistered worktree path", {
+      worktreePath,
+      repoRoot,
+    });
+    return;
+  }
+
   try {
     const r = await runGit(
-      ["worktree", "remove", "--force", worktreePath],
-      repoRoot,
+      ["worktree", "remove", "--force", check.realPath],
+      check.realRepo,
       120_000,
     );
     if (r.exitCode !== 0) {
-      // best-effort force remove directory + prune
-      await fs.rm(worktreePath, { recursive: true, force: true });
-      await runGit(["worktree", "prune"], repoRoot);
+      // best-effort force remove directory + prune — still only the verified path
+      await fs.rm(check.realPath, { recursive: true, force: true });
+      await runGit(["worktree", "prune"], check.realRepo);
     }
   } catch (err) {
-    logger.warn("worktree remove failed", { worktreePath, err: String(err) });
+    logger.warn("worktree remove failed", {
+      worktreePath: check.realPath,
+      err: String(err),
+    });
     try {
-      await fs.rm(worktreePath, { recursive: true, force: true });
-      await runGit(["worktree", "prune"], repoRoot);
+      // Re-check before recursive rm (TOCTOU defense)
+      const again = await isSafeManagedWorktreeForRemoval(
+        check.realPath,
+        check.realRepo,
+        worktreesRoot,
+      );
+      if (!again.safe) return;
+      await fs.rm(again.realPath, { recursive: true, force: true });
+      await runGit(["worktree", "prune"], again.realRepo);
     } catch {
       /* ignore */
     }

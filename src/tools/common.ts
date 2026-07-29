@@ -524,14 +524,19 @@ export async function runTool(
 
     if (sessionId) {
       store.markRunning(sessionId);
+      // Preserve managed / created_at / repo_root / worktree_name on resume upsert
+      const prior = params.resumeSessionId
+        ? await store.get(params.resumeSessionId)
+        : undefined;
       await store.upsert(sessionId, {
         mode,
-        repo_root: repoRoot ?? workingDirectory,
-        original_cwd: workingDirectory,
-        worktree_path: worktreePath ?? undefined,
-        worktree_name: worktreeName,
-        managed,
-        created_at: new Date().toISOString(),
+        repo_root: prior?.repo_root ?? repoRoot ?? workingDirectory,
+        original_cwd: prior?.original_cwd ?? workingDirectory,
+        worktree_path: worktreePath ?? prior?.worktree_path ?? undefined,
+        worktree_name: prior?.worktree_name ?? worktreeName,
+        grok_worktree_id: prior?.grok_worktree_id,
+        managed: prior?.managed ?? managed,
+        created_at: prior?.created_at ?? new Date().toISOString(),
         last_used_at: new Date().toISOString(),
         tool: params.tool,
       });
@@ -540,14 +545,14 @@ export async function runTool(
 
     await store.removePending(runId);
 
-    // Optional cleanup
+    // Optional cleanup — only managed paths under worktreesRoot
     if (
       params.keepWorktree === false &&
       worktreePath &&
       repoRoot &&
       managed
     ) {
-      await removeWorktree(repoRoot, worktreePath);
+      await removeWorktree(repoRoot, worktreePath, config.worktreesRoot);
       worktreePath = null;
     }
 

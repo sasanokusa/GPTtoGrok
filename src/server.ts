@@ -45,17 +45,19 @@ export function createServer(config: ServerConfig): McpServer {
 
   registerAllTools(server, { config, runner, store });
 
-  // Best-effort GC on start
+  // Best-effort GC on start — only managed paths under worktreesRoot that are
+  // registered to the repo. Never recursively remove caller-controlled or
+  // unregistered paths, even if sessions.json is malicious.
   void store
     .gc(config.worktreeTtlHours, async (entry) => {
-      const path =
+      const wtPath =
         "worktree_path" in entry && entry.worktree_path
           ? entry.worktree_path
           : undefined;
       const repo =
         "repo_root" in entry && entry.repo_root ? entry.repo_root : undefined;
-      if (path && repo) {
-        await removeWorktree(repo, path);
+      if (wtPath && repo) {
+        await removeWorktree(repo, wtPath, config.worktreesRoot);
       }
     })
     .then((n) => {
