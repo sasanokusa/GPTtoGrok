@@ -168,7 +168,7 @@ describe("worktree manager", () => {
     await removeWorktree(repoA, created.worktreePath, wtRoot);
   });
 
-  it("removeWorktree leaves an outside sentinel directory untouched", async () => {
+  it("removeWorktree leaves an outside sentinel directory untouched and returns false", async () => {
     const repo = initRepo();
     const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cgm-wt-root-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "cgm-wt-sentinel-"));
@@ -176,13 +176,14 @@ describe("worktree manager", () => {
     const marker = path.join(outside, "keep-me.txt");
     fs.writeFileSync(marker, "safe\n");
 
-    await removeWorktree(repo, outside, wtRoot);
+    const ok = await removeWorktree(repo, outside, wtRoot);
 
+    expect(ok).toBe(false);
     expect(fs.existsSync(outside)).toBe(true);
     expect(fs.readFileSync(marker, "utf8")).toBe("safe\n");
   });
 
-  it("removeWorktree still removes a managed worktree", async () => {
+  it("removeWorktree still removes a managed worktree and returns true", async () => {
     const repo = initRepo();
     const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cgm-wt-root-"));
     tmpDirs.push(wtRoot);
@@ -193,7 +194,68 @@ describe("worktree manager", () => {
       name: "remove-ok",
     });
     expect(fs.existsSync(created.worktreePath)).toBe(true);
-    await removeWorktree(repo, created.worktreePath, wtRoot);
+    const ok = await removeWorktree(repo, created.worktreePath, wtRoot);
+    expect(ok).toBe(true);
     expect(fs.existsSync(created.worktreePath)).toBe(false);
+  });
+
+  it("removeWorktree deletes the codex-grok/<name> branch after removal", async () => {
+    const repo = initRepo();
+    const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cgm-wt-root-"));
+    tmpDirs.push(wtRoot);
+    const name = "branch-cleanup";
+    const created = await createManagedWorktree({
+      repoRoot: repo,
+      worktreesRoot: wtRoot,
+      tool: "grok_implement",
+      name,
+    });
+    expect(created.branch).toBe(`codex-grok/${name}`);
+    // Branch exists while worktree is live
+    const before = execFileSync("git", ["branch", "--list", created.branch], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    expect(before).toContain(created.branch);
+
+    const ok = await removeWorktree(repo, created.worktreePath, wtRoot);
+    expect(ok).toBe(true);
+    expect(fs.existsSync(created.worktreePath)).toBe(false);
+
+    const after = execFileSync("git", ["branch", "--list", created.branch], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    expect(after.trim()).toBe("");
+  });
+
+  it("removeWorktree still refuses unregistered paths and does not delete branches", async () => {
+    const repo = initRepo();
+    const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cgm-wt-root-"));
+    tmpDirs.push(wtRoot);
+    // Create a real managed branch/worktree, then try to remove a fake path
+    // that should not trigger any branch delete.
+    const created = await createManagedWorktree({
+      repoRoot: repo,
+      worktreesRoot: wtRoot,
+      tool: "grok_implement",
+      name: "keep-branch",
+    });
+    const fake = path.join(wtRoot, "not-registered");
+    fs.mkdirSync(fake, { recursive: true });
+
+    const refused = await removeWorktree(repo, fake, wtRoot);
+    expect(refused).toBe(false);
+
+    expect(fs.existsSync(created.worktreePath)).toBe(true);
+    const stillThere = execFileSync(
+      "git",
+      ["branch", "--list", created.branch],
+      { cwd: repo, encoding: "utf8" },
+    );
+    expect(stillThere).toContain(created.branch);
+
+    const cleaned = await removeWorktree(repo, created.worktreePath, wtRoot);
+    expect(cleaned).toBe(true);
   });
 });

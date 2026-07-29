@@ -404,8 +404,8 @@ Grok’s `workspace` sandbox grants **write access to process CWD** (+ `~/.grok/
 | **Continue, optional caller `worktree_path`** | Must **exactly match** stored path (realpath); mismatch → `GROK_MCP_WORKTREE_INVALID`. |
 | **Continue, session unknown to MCP store** | Write mode without store entry → `GROK_MCP_SESSION_NOT_FOUND` (unmapped write sessions are rejected). read_only or `allow_unmapped_session=true` may attempt `grok -r` with `--cwd working_directory`. |
 | **Concurrent runs same repo** | Allowed; distinct worktree names/paths. Session store uses file lock + atomic write. |
-| **Cancel after worktree create** | Kill process group; worktree path already known — keep unless `keep_worktree=false` on success path only; orphans eligible for TTL GC. |
-| **`keep_worktree`** | Single param (default `true`). `false` → cleanup after **successful** result only. **No** `cleanup_worktree` alias. |
+| **Cancel after worktree create** | Kill process group; worktree path already known — keep unless `keep_worktree=false` (then best-effort remove on both success and failure paths); orphans eligible for TTL GC via `pending_worktrees`. |
+| **`keep_worktree`** | Single param (default `true`). `false` → best-effort worktree removal after the run completes (success **or** failure). If removal fails, the `pending_worktrees` entry is kept so GC can retry. **No** `cleanup_worktree` alias. |
 | **Cleanup IDs** | Prefer `git worktree remove --force <worktree_path>` for managed trees; store path always. Grok worktree id only for opt-in `-w` path. |
 | **Managed worktree location** | `~/.cache/codex-grok-mcp/worktrees/<repo_hash>/<name>` (outside repo_root). TTL GC walks this tree. |
 | **Non-git directory** | write tools → `GROK_MCP_NOT_A_GIT_REPO`; analyze/review read_only OK. |
@@ -415,7 +415,7 @@ Grok’s `workspace` sandbox grants **write access to process CWD** (+ `~/.grok/
 
 | Trigger | Action |
 |---------|--------|
-| `keep_worktree: false` after success | Remove via Grok id or `git worktree remove` |
+| `keep_worktree: false` after run ends | Remove via `git worktree remove` on success **and** failure; keep `pending_worktrees` if removal did not actually clear the path |
 | TTL (default **72h** since `last_used_at`) | GC on **server start only** (not after tool calls); **never GC sessions with `running=true`**; only remove validated managed worktrees (absolute realpath under managed cache root, registered via `git worktree list`, `managed === true`) |
 | Process exit | Default: keep; `GROK_MCP_CLEANUP_ON_EXIT=1` best-effort remove process-created trees |
 | Manual | README: `grok worktree list`, `grok worktree rm <id>`, `grok worktree gc --max-age 72h` |

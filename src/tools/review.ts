@@ -1,8 +1,18 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { isGrokMcpError } from "../errors.js";
 import { getDiffVsRef } from "../git.js";
+import { logger } from "../log.js";
 import { ReviewInputSchema } from "../types.js";
 import type { ToolContext } from "./common.js";
 import { runTool, toolErrorToMcp } from "./common.js";
+
+/**
+ * True when a diff-collection failure must abort the review (bad/unsafe base_ref)
+ * rather than degrade to a prompt-only review.
+ */
+export function shouldRethrowReviewDiffError(err: unknown): boolean {
+  return isGrokMcpError(err) && err.code === "GROK_MCP_INVALID_ARGS";
+}
 
 export function registerReview(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
@@ -22,6 +32,7 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
       try {
         const input = ReviewInputSchema.parse(args);
         let prompt = input.prompt;
+        const extraWarnings: string[] = [];
         if (input.inject_diff !== false) {
           try {
             const baseRef = input.base_ref || "HEAD";
@@ -38,8 +49,15 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
               ? `(no diff vs ${baseRef})`
               : `### stat\n${d.stat}\n\n### diff\n${d.diff}`;
             prompt = `${input.prompt}\n\n## Diff vs ${baseRef} (server-injected, may be truncated)\n${body}`;
-          } catch {
+          } catch (err) {
+            if (shouldRethrowReviewDiffError(err)) {
+              throw err;
+            }
+            logger.warn("Failed to collect git diff for review; degrading", {
+              err: String(err),
+            });
             prompt = `${input.prompt}\n\n## Diff vs base_ref\n(failed to collect git diff; review from prompt context only)`;
+            extraWarnings.push("DIFF_UNAVAILABLE");
           }
         }
 
@@ -68,6 +86,7 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
           worktreeName: input.worktree_name,
           keepWorktree: input.keep_worktree,
           signal: extra.signal,
+          extraWarnings: extraWarnings.length ? extraWarnings : undefined,
         });
         const text = JSON.stringify(result, null, 2);
         return {

@@ -75,6 +75,84 @@ export interface RunToolParams {
   worktreePathOverride?: string;
   restoreCode?: boolean;
   signal?: AbortSignal;
+  /** Optional warnings to merge into the result (e.g. DIFF_UNAVAILABLE from review). */
+  extraWarnings?: string[];
+}
+
+/**
+ * Stable content-sensitive digest of an assembled working-tree diff.
+ * Includes both path list and patch body so edits to already-dirty files are detected.
+ */
+export function digestDiffAssembly(asm: {
+  changedFiles: string[];
+  diff: string;
+}): string {
+  return crypto
+    .createHash("sha256")
+    .update(asm.changedFiles.join("\n"))
+    .update("\0")
+    .update(asm.diff)
+    .digest("hex");
+}
+
+/**
+ * Decide how a read_only run should report working-tree mutations.
+ * Inputs are digests from {@link digestDiffAssembly} (or null if unavailable).
+ * - baseline null: not a git repo / baseline unavailable → no warning, leave diff as assembled
+ * - after null: post-run digest unavailable → no warning, leave diff as assembled
+ * - same digest: no warning; suppress pre-existing WIP from returned diff/changed_files
+ * - different digest: warn UNEXPECTED_MUTATION and keep the post-run diff
+ */
+export function evaluateReadOnlyMutation(
+  baselineDigest: string | null,
+  afterDigest: string | null,
+): { unexpectedMutation: boolean; useEmptyDiff: boolean } {
+  if (baselineDigest === null || afterDigest === null) {
+    return { unexpectedMutation: false, useEmptyDiff: false };
+  }
+  if (baselineDigest !== afterDigest) {
+    return { unexpectedMutation: true, useEmptyDiff: false };
+  }
+  return { unexpectedMutation: false, useEmptyDiff: true };
+}
+
+/**
+ * Plan finally-block cleanup for a run's pending_worktrees entry / managed worktree.
+ *
+ * Rules:
+ * 1. Success → drop pending when nothing remains to reap (worktree already removed on
+ *    success path, or a session record holds worktree_path for GC). If keepWorktree
+ *    was false but the managed path is still present, removal failed — keep pending.
+ * 2. Failure + keepWorktree===false + managed worktree still present → remove the
+ *    worktree; intent is also to drop pending (call site must KEEP pending if
+ *    removeWorktree returns false or throws so GC can retry).
+ * 3. Failure + worktree still kept (keep_worktree true/undefined) → keep pending
+ *    so SessionStore.gc() can reap at TTL.
+ * 4. No managed worktree was created → drop pending (harmless no-op if never added).
+ */
+export function planRunCleanup(opts: {
+  succeeded: boolean;
+  managedWorktreePath: string | null;
+  keepWorktree: boolean | undefined;
+}): { removeWorktree: boolean; removePending: boolean } {
+  if (opts.succeeded) {
+    // keep_worktree=false but path still present → success-path removal failed; keep pending.
+    if (opts.managedWorktreePath && opts.keepWorktree === false) {
+      return { removeWorktree: false, removePending: false };
+    }
+    return { removeWorktree: false, removePending: true };
+  }
+
+  if (!opts.managedWorktreePath) {
+    return { removeWorktree: false, removePending: true };
+  }
+
+  if (opts.keepWorktree === false) {
+    return { removeWorktree: true, removePending: true };
+  }
+
+  // Failure with worktree retained — keep pending so GC can reap.
+  return { removeWorktree: false, removePending: false };
 }
 
 /** Permission modes that would undermine read_only isolation. */
@@ -266,7 +344,16 @@ export async function runTool(
   const runId = crypto.randomUUID();
   store.markRunning(runId);
   const warnings: string[] = [];
+  if (params.extraWarnings?.length) {
+    warnings.push(...params.extraWarnings);
+  }
   const started = Date.now();
+
+  // Hoisted so the finally block can clean up pending records / worktrees on failure.
+  let worktreePath: string | null = null;
+  let repoRoot: string | undefined;
+  let managed = false;
+  let succeeded = false;
 
   try {
     rejectTestCommandInReadOnly(params.mode, params.testCommand);
@@ -285,13 +372,20 @@ export async function runTool(
 
     let mode = params.mode;
     let effectiveCwd = workingDirectory;
-    let worktreePath: string | null = null;
     let worktreeName: string | undefined;
-    let repoRoot: string | undefined;
     let originalBaseline = "";
-    let managed = false;
+    /** Pre-run content digest for read_only mutation detection; null = not captured. */
+    let readOnlyBaselineDigest: string | null = null;
     let useGrokWorktree =
       params.useGrokWorktree ?? config.useGrokWorktree ?? false;
+    const redactCfg = {
+      secretBasenames: config.secretBasenames,
+      aggressive: config.secretGlobsAggressive,
+    };
+    const diffOpts = {
+      maxDiffBytes: config.maxDiffBytes,
+      maxUntrackedFileBytes: config.maxUntrackedFileBytes,
+    };
 
     // Load prior resume record before runtime worktree setup / cleanup / upsert
     // so managed metadata is preserved across continue (including keepWorktree=false).
@@ -365,6 +459,21 @@ export async function runTool(
           repo_root: repoRoot,
           created_at: new Date().toISOString(),
         });
+      }
+    } else if (mode === "read_only") {
+      // Content-sensitive baseline via assembleDiff (includes untracked file bodies).
+      // Not a git repo / failure → skip silently (no baseline, no UNEXPECTED_MUTATION).
+      try {
+        if (await isGitRepo(workingDirectory)) {
+          const baselineAsm = await assembleDiff(
+            workingDirectory,
+            redactCfg,
+            diffOpts,
+          );
+          readOnlyBaselineDigest = digestDiffAssembly(baselineAsm);
+        }
+      } catch {
+        readOnlyBaselineDigest = null;
       }
     }
 
@@ -450,20 +559,27 @@ export async function runTool(
     if (parse.maxTurnsReached) warnings.push("MAX_TURNS_REACHED");
 
     // Collect git state
-    const redactCfg = {
-      secretBasenames: config.secretBasenames,
-      aggressive: config.secretGlobsAggressive,
-    };
     const inspectCwd =
       mode === "write_worktree" && worktreePath ? worktreePath : effectiveCwd;
-    const diffAsm = await assembleDiff(inspectCwd, redactCfg, {
-      maxDiffBytes: config.maxDiffBytes,
-      maxUntrackedFileBytes: config.maxUntrackedFileBytes,
-    });
+    let diffAsm = await assembleDiff(inspectCwd, redactCfg, diffOpts);
     warnings.push(...diffAsm.warnings);
 
-    if (mode === "read_only" && (diffAsm.changedFiles.length || diffAsm.diff.trim())) {
-      warnings.push("UNEXPECTED_MUTATION");
+    if (mode === "read_only") {
+      const afterDigest =
+        readOnlyBaselineDigest !== null
+          ? digestDiffAssembly(diffAsm)
+          : null;
+      const decision = evaluateReadOnlyMutation(
+        readOnlyBaselineDigest,
+        afterDigest,
+      );
+      if (decision.unexpectedMutation) {
+        warnings.push("UNEXPECTED_MUTATION");
+      }
+      if (decision.useEmptyDiff) {
+        // Do not surface the caller's pre-existing uncommitted work.
+        diffAsm = { changedFiles: [], diff: "", warnings: diffAsm.warnings };
+      }
     }
 
     let originalTreeStatus: string | undefined;
@@ -554,20 +670,39 @@ export async function runTool(
       store.markDone(sessionId);
     }
 
-    await store.removePending(runId);
-
     // Optional cleanup — only managed paths under worktreesRoot.
     // On resume, `managed` is restored from the prior session record above.
+    // Pending removal and failure-path worktree cleanup happen in `finally`.
     if (
       params.keepWorktree === false &&
       worktreePath &&
       repoRoot &&
       managed
     ) {
-      await removeWorktree(repoRoot, worktreePath, config.worktreesRoot);
-      worktreePath = null;
+      try {
+        const removed = await removeWorktree(
+          repoRoot,
+          worktreePath,
+          config.worktreesRoot,
+        );
+        if (removed) {
+          worktreePath = null; // prevent double-remove; pending may drop in finally
+        } else {
+          // Path stays in the result; planRunCleanup keeps pending for GC retry.
+          logger.warn("keep_worktree=false but worktree still present after remove", {
+            worktreePath,
+          });
+        }
+      } catch (err) {
+        logger.warn("keep_worktree=false removeWorktree threw", {
+          worktreePath,
+          err: String(err),
+        });
+        // worktreePath remains so pending is retained
+      }
     }
 
+    succeeded = true;
     return assembleResult({
       summary,
       changedFiles: diffAsm.changedFiles,
@@ -592,6 +727,50 @@ export async function runTool(
       },
     });
   } finally {
+    const cleanup = planRunCleanup({
+      succeeded,
+      managedWorktreePath: managed && worktreePath ? worktreePath : null,
+      keepWorktree: params.keepWorktree,
+    });
+
+    let worktreeRemovalFailed = false;
+    if (cleanup.removeWorktree && worktreePath && repoRoot && managed) {
+      try {
+        const removed = await removeWorktree(
+          repoRoot,
+          worktreePath,
+          config.worktreesRoot,
+        );
+        // false return is the common failure mode (removeWorktree swallows most errors).
+        if (!removed) {
+          worktreeRemovalFailed = true;
+          logger.warn("worktree cleanup on failure path did not remove path", {
+            worktreePath,
+          });
+        }
+      } catch (err) {
+        // Keep the pending record so SessionStore.gc() can retry later.
+        worktreeRemovalFailed = true;
+        logger.warn("worktree cleanup on failure path failed", {
+          worktreePath,
+          err: String(err),
+        });
+      }
+    }
+
+    // Drop pending only when nothing is left to reap. If we intended to remove
+    // a managed worktree and that failed (false or throw), keep pending for GC.
+    if (cleanup.removePending && !worktreeRemovalFailed) {
+      try {
+        await store.removePending(runId);
+      } catch (err) {
+        logger.warn("removePending failed during cleanup", {
+          runId,
+          err: String(err),
+        });
+      }
+    }
+
     store.markDone(runId);
   }
 }

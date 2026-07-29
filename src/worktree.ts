@@ -332,15 +332,46 @@ export async function createManagedWorktree(
 }
 
 /**
+ * Best-effort delete of the branch created by `createManagedWorktree`
+ * (`codex-grok/<worktreeName>`). Failures are logged only — never fail removal.
+ */
+async function deleteManagedWorktreeBranch(
+  repoRoot: string,
+  worktreePath: string,
+): Promise<void> {
+  const worktreeName = path.basename(worktreePath);
+  if (!worktreeName) return;
+  const branch = `codex-grok/${worktreeName}`;
+  try {
+    const r = await runGit(["branch", "-D", branch], repoRoot);
+    if (r.exitCode !== 0) {
+      logger.warn("Failed to delete managed worktree branch", {
+        branch,
+        stderr: r.stderr.slice(-400),
+      });
+    }
+  } catch (err) {
+    logger.warn("Failed to delete managed worktree branch", {
+      branch,
+      err: String(err),
+    });
+  }
+}
+
+/**
  * Remove a managed worktree only if it is strictly under worktreesRoot and
  * registered to the repo. Never recursively removes caller-controlled or
  * unregistered paths (even if sessions.json is malicious).
+ * After a successful removal, best-effort deletes `codex-grok/<basename>`.
+ *
+ * @returns `true` only when the worktree directory is actually gone afterwards;
+ *          `false` for unsafe/unregistered paths or if every removal strategy failed.
  */
 export async function removeWorktree(
   repoRoot: string,
   worktreePath: string,
   worktreesRoot: string,
-): Promise<void> {
+): Promise<boolean> {
   const check = await isSafeManagedWorktreeForRemoval(
     worktreePath,
     repoRoot,
@@ -351,7 +382,7 @@ export async function removeWorktree(
       worktreePath,
       repoRoot,
     });
-    return;
+    return false;
   }
 
   try {
@@ -367,7 +398,7 @@ export async function removeWorktree(
         check.realRepo,
         worktreesRoot,
       );
-      if (!again.safe) return;
+      if (!again.safe) return false;
       await fs.rm(again.realPath, { recursive: true, force: true });
       await runGit(["worktree", "prune"], again.realRepo);
     }
@@ -383,13 +414,32 @@ export async function removeWorktree(
         check.realRepo,
         worktreesRoot,
       );
-      if (!again.safe) return;
+      if (!again.safe) return false;
       await fs.rm(again.realPath, { recursive: true, force: true });
       await runGit(["worktree", "prune"], again.realRepo);
     } catch {
-      /* ignore */
+      /* fall through to existence check */
     }
   }
+
+  // Trust the filesystem, not exit codes alone.
+  let stillThere = false;
+  try {
+    await fs.access(check.realPath);
+    stillThere = true;
+  } catch {
+    stillThere = false;
+  }
+
+  if (stillThere) {
+    logger.warn("Managed worktree still present after removal attempts", {
+      worktreePath: check.realPath,
+    });
+    return false;
+  }
+
+  await deleteManagedWorktreeBranch(check.realRepo, check.realPath);
+  return true;
 }
 
 export async function pathExists(p: string): Promise<boolean> {
