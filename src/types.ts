@@ -1,5 +1,28 @@
 import { z } from "zod";
+import type {
+  DiffStats,
+  EffectiveResponseMode,
+  ResponseMode,
+} from "./diff-artifact.js";
 import { GrokMcpError } from "./errors.js";
+
+/**
+ * How much of the redacted diff the MCP response carries.
+ *
+ * - `auto` (default): inline while the redacted diff is <= `GROK_MCP_INLINE_DIFF_MAX_BYTES`
+ * - `full`: inline the whole redacted diff (subject to the hard inline cap)
+ * - `compact`: omit the diff body, write it to `diff_artifact_path` instead
+ * - `summary_only`: omit both the diff body and the artifact
+ *
+ * Accepted by every tool. Read-only runs normally produce an empty diff, so
+ * `auto` resolves to `full` there; explicit modes still apply to the diff that
+ * an `UNEXPECTED_MUTATION` would surface.
+ */
+export const ResponseModeSchema = z
+  .enum(["auto", "full", "compact", "summary_only"])
+  .describe(
+    'How much diff to return: "auto" (size-based, default), "full", "compact" (diff written to diff_artifact_path), or "summary_only".',
+  );
 
 export const WorkingDirectorySchema = z
   .string()
@@ -97,6 +120,7 @@ export const BaseToolInputSchema = z.object({
   sandbox: z.string().optional(),
   allow_web: z.boolean().optional().default(false),
   allow_subagents: z.boolean().optional().default(false),
+  response_mode: ResponseModeSchema.optional().default("auto"),
 });
 
 /**
@@ -182,6 +206,8 @@ export const ContinueInputSchema = z.object({
   allow_web: z.boolean().optional().default(false),
   allow_subagents: z.boolean().optional().default(false),
   keep_worktree: z.boolean().optional().default(true),
+  // Per-call, never inherited from the resumed session: each continue defaults to "auto".
+  response_mode: ResponseModeSchema.optional().default("auto"),
 });
 
 export type BaseToolInput = z.infer<typeof BaseToolInputSchema>;
@@ -205,10 +231,19 @@ export interface TestsResult {
   };
 }
 
+/**
+ * Frozen tool result contract.
+ *
+ * `result_version` stays **1**: the response-mode fields below are purely
+ * additive and every pre-existing field keeps its meaning and type. Callers
+ * that ignore them and read `diff` behave exactly as before, because the
+ * default `response_mode: "auto"` inlines diffs up to the threshold.
+ */
 export interface GrokToolResult {
   result_version: 1;
   summary: string;
   changed_files: string[];
+  /** Redacted patch body. Empty string when `diff_included` is false. */
   diff: string;
   tests: TestsResult;
   session_id: string | null;
@@ -217,6 +252,21 @@ export interface GrokToolResult {
   mode: ExecutionMode;
   working_directory: string;
   effective_cwd: string;
+  /** Mode the caller asked for (defaults to "auto"). */
+  response_mode_requested: ResponseMode;
+  /** Mode actually applied — what `auto` picked, or a safety downgrade. */
+  response_mode_effective: EffectiveResponseMode;
+  /** True only when `diff` holds the complete redacted patch. */
+  diff_included: boolean;
+  /** UTF-8 byte length of the redacted patch (independent of `diff_included`). */
+  diff_bytes: number;
+  /** SHA-256 (hex) of the redacted patch that was returned and/or stored. */
+  diff_sha256: string;
+  diff_stats: DiffStats;
+  /** Absolute path to the stored redacted patch, or null. */
+  diff_artifact_path: string | null;
+  /** Short follow-up hints when the diff body was not inlined. */
+  next_actions: string[];
   meta: {
     stop_reason?: string;
     usage?: Record<string, unknown>;
@@ -255,6 +305,12 @@ export interface SessionStoreData {
   pending_worktrees: PendingWorktree[];
   sessions: Record<string, SessionRecord>;
 }
+
+export type {
+  DiffStats,
+  EffectiveResponseMode,
+  ResponseMode,
+} from "./diff-artifact.js";
 
 export type ToolName =
   | "grok_analyze"

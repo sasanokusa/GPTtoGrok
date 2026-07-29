@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { ServerConfig } from "./config.js";
+import { gcDiffArtifacts } from "./diff-artifact.js";
 import { GrokRunner } from "./grok-runner.js";
 import { logger } from "./log.js";
 import { SessionStore } from "./session-store.js";
@@ -20,6 +21,13 @@ REQUIREMENTS:
 - Continue with grok_continue + session_id from prior results (opaque id; prefer exact UUID from result).
 - read_only tools must not modify files; report UNEXPECTED_MUTATION warnings if they do.
 - Never put secrets (.env, private keys, auth files) into prompts.
+
+RESPONSE SIZE:
+- Optional response_mode: auto (default) | full | compact | summary_only.
+- auto inlines the diff up to GROK_MCP_INLINE_DIFF_MAX_BYTES (64 KiB), else compact.
+- If diff_included is false, the diff field is "": read diff_artifact_path (compact)
+  or inspect changed_files under worktree_path, and follow next_actions.
+- diff_bytes / diff_sha256 / diff_stats are always returned and describe the redacted patch.
 
 Tools:
 - grok_analyze — read-only analysis
@@ -81,6 +89,15 @@ export function createServer(config: ServerConfig): McpServer {
       if (n > 0) logger.info("GC removed stale worktrees", { count: n });
     })
     .catch((err) => logger.warn("GC failed", { err: String(err) }));
+
+  // Same TTL GC for compact-mode diff artifacts. Only validated managed
+  // artifacts under `<cacheDir>/diffs` are removed — never symlinks, files
+  // outside the cache root, or unmanaged names.
+  void gcDiffArtifacts(config.cacheDir, config.worktreeTtlHours)
+    .then((n) => {
+      if (n > 0) logger.info("GC removed stale diff artifacts", { count: n });
+    })
+    .catch((err) => logger.warn("Diff artifact GC failed", { err: String(err) }));
 
   return server;
 }

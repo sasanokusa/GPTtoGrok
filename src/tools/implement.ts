@@ -9,7 +9,7 @@ export function registerImplement(server: McpServer, ctx: ToolContext): void {
     {
       title: "Grok Implement (isolated worktree)",
       description:
-        "Implement a feature or fix via Grok Build in an isolated git worktree (does not edit the original tree by default). Returns worktree_path, diff, and changed_files for Codex to apply. Requires absolute working_directory and a git repo. Set Codex tool_timeout_sec=2400.",
+        "Implement a feature or fix via Grok Build in an isolated git worktree (does not edit the original tree by default). Returns worktree_path, diff, and changed_files for Codex to apply. Optional response_mode (auto|full|compact|summary_only) controls how much diff is returned; when diff_included is false read diff_artifact_path or the worktree. Requires absolute working_directory and a git repo. Set Codex tool_timeout_sec=2400.",
       inputSchema: ImplementInputSchema,
       annotations: {
         readOnlyHint: false,
@@ -41,6 +41,7 @@ export function registerImplement(server: McpServer, ctx: ToolContext): void {
           sandbox: input.sandbox,
           allowWeb: input.allow_web,
           allowSubagents: input.allow_subagents,
+          responseMode: input.response_mode,
           worktreeRef: input.worktree_ref,
           worktreeName: input.worktree_name,
           keepWorktree: input.keep_worktree,

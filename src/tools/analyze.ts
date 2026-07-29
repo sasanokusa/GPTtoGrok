@@ -9,7 +9,7 @@ export function registerAnalyze(server: McpServer, ctx: ToolContext): void {
     {
       title: "Grok Analyze (read-only)",
       description:
-        "Read-only codebase analysis via Grok Build headless CLI. Does not create a worktree. Requires absolute working_directory. Codex must set tool_timeout_sec >= 2400 on this MCP server. Does not accept test_command (read_only); permission_mode limited to dontAsk|plan; sandbox limited to read-only.",
+        "Read-only codebase analysis via Grok Build headless CLI. Does not create a worktree. Requires absolute working_directory. Codex must set tool_timeout_sec >= 2400 on this MCP server. Does not accept test_command (read_only); permission_mode limited to dontAsk|plan; sandbox limited to read-only. Accepts response_mode, but read_only runs normally return an empty diff so it is usually a no-op.",
       inputSchema: AnalyzeInputSchema,
       annotations: {
         readOnlyHint: true,
@@ -38,6 +38,7 @@ export function registerAnalyze(server: McpServer, ctx: ToolContext): void {
           sandbox: input.sandbox,
           allowWeb: input.allow_web,
           allowSubagents: input.allow_subagents,
+          responseMode: input.response_mode,
           signal: extra.signal,
         });
         const text = JSON.stringify(result, null, 2);

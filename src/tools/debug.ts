@@ -9,7 +9,7 @@ export function registerDebug(server: McpServer, ctx: ToolContext): void {
     {
       title: "Grok Debug",
       description:
-        "Debug and optionally fix issues via Grok Build. Defaults to write_worktree (isolated). Can pass mode=read_only for diagnosis only. Returns worktree_path/diff when writing. Absolute working_directory required. When effective mode is read_only, test_command is rejected and unsafe permission_mode/sandbox values (bypassPermissions, acceptEdits, auto, default; sandbox off|workspace) are rejected.",
+        "Debug and optionally fix issues via Grok Build. Defaults to write_worktree (isolated). Can pass mode=read_only for diagnosis only. Returns worktree_path/diff when writing. Optional response_mode (auto|full|compact|summary_only) controls how much diff is returned; when diff_included is false read diff_artifact_path or the worktree. Absolute working_directory required. When effective mode is read_only, test_command is rejected and unsafe permission_mode/sandbox values (bypassPermissions, acceptEdits, auto, default; sandbox off|workspace) are rejected.",
       inputSchema: DebugInputSchema,
       annotations: {
         readOnlyHint: false,
@@ -41,6 +41,7 @@ export function registerDebug(server: McpServer, ctx: ToolContext): void {
           sandbox: input.sandbox,
           allowWeb: input.allow_web,
           allowSubagents: input.allow_subagents,
+          responseMode: input.response_mode,
           worktreeRef: input.worktree_ref,
           worktreeName: input.worktree_name,
           keepWorktree: input.keep_worktree,

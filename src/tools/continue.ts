@@ -18,7 +18,7 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
     {
       title: "Grok Continue (resume session)",
       description:
-        "Resume a prior Grok session via --resume <session_id>. Pass the exact session_id from a previous result. Never creates a new worktree (-w). If prior mode was write_worktree and worktree is missing, fails closed unless allow_missing_worktree downgrades to read_only (cannot combine with mode=write_worktree).",
+        "Resume a prior Grok session via --resume <session_id>. Pass the exact session_id from a previous result. Optional response_mode (auto|full|compact|summary_only) applies to this call only and defaults to auto (never inherited from the session). Never creates a new worktree (-w). If prior mode was write_worktree and worktree is missing, fails closed unless allow_missing_worktree downgrades to read_only (cannot combine with mode=write_worktree).",
       inputSchema: ContinueInputSchema,
       annotations: {
         readOnlyHint: false,
@@ -213,6 +213,8 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
           sandbox: input.sandbox,
           allowWeb: input.allow_web,
           allowSubagents: input.allow_subagents,
+          // Per-call: never inherited from the resumed session record.
+          responseMode: input.response_mode,
           keepWorktree: input.keep_worktree,
           resumeSessionId: input.session_id,
           worktreePathOverride: worktreePath,

@@ -21,8 +21,11 @@ Design document: `docs/design-codex-grok-mcp.md`.
 3. **`working_directory` must be absolute.** Relative paths are rejected (`src/path-guard.ts`).
 4. **write_worktree default recipe**: create managed git worktree under cache **first**, then spawn Grok with `--cwd <worktree_path>` (**no** `-w`) and `--sandbox workspace`. Do not use `--cwd original -w --sandbox workspace`.
 5. **read_only** denylist must include **both** `run_terminal_cmd` and `run_terminal_command`, plus `Agent` (`src/tool-ids.ts`).
-6. Result contract is frozen at `result_version: 1` (`src/types.ts`, `src/result.ts`).
+6. Result contract is frozen at `result_version: 1` (`src/types.ts`, `src/result.ts`). Additive fields only — never remove or retype an existing field.
 7. Codex example config **must** keep `tool_timeout_sec = 2400`.
+8. **`response_mode` never changes what is redacted.** The order in `runTool` is fixed: collect → drop secret-path hunks → content redaction → measure bytes/hash → pick mode → inline **or** write artifact. `compact` must keep re-using the single redacted string; never re-collect a diff for the artifact, and never write an unredacted diff to a temp file (`src/diff-artifact.ts`, `applyResponseMode` in `src/tools/common.ts`).
+9. **Never fall back to inlining a raw diff.** Artifact write failure degrades to `summary_only`; a `full` request over the hard cap degrades to `compact` with the patch stored whole. Both must warn.
+10. Diff artifacts are written only under `<cacheDir>/diffs/<scope_digest>/<uuid>.diff` with `O_EXCL` + `0600` + `rename`. GC deletes only realpath-validated managed artifacts — never symlinks, unmanaged names, or anything outside the cache root.
 
 ## Layout
 
@@ -35,6 +38,7 @@ Design document: `docs/design-codex-grok-mcp.md`.
 | `src/streaming-json.ts` | NDJSON parser |
 | `src/worktree.ts` | Managed worktree create/remove |
 | `src/git.ts` | Diff algorithm (apply-friendly) |
+| `src/diff-artifact.ts` | `response_mode` sizing, diff artifact write/GC |
 | `src/session-store.ts` | Atomic `sessions.json` |
 | `examples/codex-config.toml` | Codex host config |
 
@@ -60,6 +64,8 @@ npm run dev   # run stdio server
 - [ ] Isolation recipe unchanged unless design doc updated
 - [ ] Both shell tool IDs still denied for read_only
 - [ ] Do not widen `test_command` execution (host `/bin/sh -c` outside Grok sandbox; keep rejected in read_only; no login shell)
+- [ ] Diff artifacts still contain only redacted content, stay under the cache root, and resist symlink escape
+- [ ] Artifact GC still refuses symlinks, unmanaged names, and paths outside the cache root
 
 ## Out of scope
 

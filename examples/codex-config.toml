@@ -40,6 +40,14 @@ GROK_MCP_LOG_LEVEL = "info"
 # GROK_MCP_USE_GROK_WORKTREE = "1"
 # GROK_MCP_FAIL_ON_ORIGINAL_DIRTY = "1"
 
+# Diff return volume (response_mode). "auto" inlines the redacted diff while it
+# is <= this many bytes, otherwise it returns a compact result plus an on-disk
+# diff artifact. Lower this if Codex context is tight; 0 = never inline.
+# GROK_MCP_INLINE_DIFF_MAX_BYTES = "65536"
+# Absolute inline ceiling; an explicit response_mode="full" larger than this
+# degrades to compact (warning DIFF_HARD_LIMIT_APPLIED) instead of truncating.
+# GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES = "1048576"
+
 # If Codex scrubs the parent environment when spawning MCP servers, explicitly
 # forward vars Grok needs (names depend on host policy):
 # HOME = "/Users/YOU"

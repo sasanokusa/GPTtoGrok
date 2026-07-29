@@ -20,11 +20,12 @@ Every successful call returns versioned JSON (`result_version: 1`) with:
 
 - `summary` — agent text (redacted)
 - `changed_files` — relative paths (secret basenames omitted)
-- `diff` — apply-friendly patch (untracked files included; **secret-path hunks omitted**)
+- `diff` — apply-friendly patch (untracked files included; **secret-path hunks omitted**). Empty string when `diff_included` is `false` — see [Response modes](#response-modes)
 - `tests` — optional `test_command` result (**write_worktree only**; rejected in effective `read_only`)
 - `session_id` — for `grok_continue`
 - `worktree_path` — isolated tree for write modes
 - `warnings` — e.g. `ORIGINAL_TREE_DIRTY`, `UNEXPECTED_MUTATION`, `REDACTED_SECRET_PATHS`
+- `response_mode_requested` / `response_mode_effective`, `diff_included`, `diff_bytes`, `diff_sha256`, `diff_stats`, `diff_artifact_path`, `next_actions` — see [Response modes](#response-modes)
 
 ### Shared optional inputs
 
@@ -33,6 +34,7 @@ Every successful call returns versioned JSON (`result_version: 1`) with:
 | `reasoning_effort` | Public enum: `none` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. Mapped 1:1 to Grok CLI `--reasoning-effort`. |
 | `model` | Passed as `-m`. For deeper analysis on current Grok, prefer **Grok 4.5** with `reasoning_effort: "high"`. |
 | `test_command` | Allowed only when the **effective** mode is `write_worktree`. Effective `read_only` → `GROK_MCP_INVALID_ARGS`. |
+| `response_mode` | `auto` (default) \| `full` \| `compact` \| `summary_only`. Controls how much diff the MCP response carries. See [Response modes](#response-modes). |
 | `tools` / `disallowed_tools` | See [read_only policy](#readonly-policy) below. |
 | `permission_mode` / `sandbox` / `allow_subagents` | Restricted in `read_only` (see below). |
 
@@ -46,6 +48,188 @@ Example (analyze with Grok 4.5 high effort):
   "reasoning_effort": "high"
 }
 ```
+
+## Response modes
+
+A large Grok diff returned in full burns MCP response size and parent-model context on
+every call. `response_mode` controls how much of the patch travels back to Codex /
+Claude Code — **without** weakening isolation, redaction, or session continuity.
+
+| Mode | `diff` body | Artifact on disk | Use when |
+|------|-------------|------------------|----------|
+| `auto` *(default)* | inlined while ≤ `GROK_MCP_INLINE_DIFF_MAX_BYTES` (64 KiB) | only when it falls back to `compact` | almost always |
+| `full` | always inlined | no | you want the patch in context regardless of size |
+| `compact` | omitted (`""`) | yes → `diff_artifact_path` | large refactors; read the patch only if needed |
+| `summary_only` | omitted (`""`) | no | you will review the worktree directly |
+
+`response_mode` is accepted by **all five tools** and is **per call** — `grok_continue`
+does *not* inherit the previous call's mode; each continue defaults to `auto` again.
+
+On read-only runs (`grok_analyze`, `grok_review`, `grok_debug` with `mode=read_only`)
+the diff is normally empty, so `auto` resolves to `full` and the setting is a no-op.
+It still applies to the diff that an `UNEXPECTED_MUTATION` would surface.
+
+### Result fields
+
+Present on **every** result, in all modes:
+
+| Field | Meaning |
+|-------|---------|
+| `response_mode_requested` | what the caller asked for (`"auto"` when omitted) |
+| `response_mode_effective` | `"full"` \| `"compact"` \| `"summary_only"` — what actually happened |
+| `diff_included` | `true` only when `diff` holds the complete patch |
+| `diff_bytes` | UTF-8 byte length of the **redacted** patch (regardless of `diff_included`) |
+| `diff_sha256` | SHA-256 of the redacted patch that was returned and/or stored |
+| `diff_stats` | `{ files_changed, insertions, deletions }` — parsed from the redacted patch, not from `git diff --stat` text |
+| `diff_artifact_path` | absolute path to the stored patch, or `null` |
+| `next_actions` | 3 short hints when the diff was not inlined; `[]` for `full` |
+
+With no changes the shape stays consistent: `diff_bytes: 0`, `diff_sha256` = the
+empty-string digest, `diff_stats` all zeroes, `diff_artifact_path: null`.
+
+`diff_stats.files_changed` counts `diff --git` headers in the patch, so it can be
+lower than `changed_files.length` when binary or oversized untracked files were
+listed but not patched.
+
+### Warnings
+
+| Warning | Meaning |
+|---------|---------|
+| `DIFF_NOT_INLINED` | a non-empty patch was omitted from the response |
+| `DIFF_ARTIFACT_CREATED` | the patch was written to `diff_artifact_path` |
+| `DIFF_HARD_LIMIT_APPLIED` | `full` exceeded `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` and was degraded to `compact` — the patch is **not** truncated, it is stored whole |
+| `DIFF_ARTIFACT_WRITE_FAILED` | the artifact could not be written; the call degrades to `summary_only` rather than inlining a huge patch. `summary`, `changed_files`, `worktree_path`, `diff_stats` and `diff_sha256` are still returned |
+| `DIFF_DISCARDED_NO_ARTIFACT` | no diff body, no artifact **and** `keep_worktree: false` — the patch is unrecoverable after this call. `next_actions` tells you how to re-run |
+
+### Examples
+
+**`auto` — normal use (just omit the field):**
+
+```json
+{
+  "prompt": "Add retry with backoff to the HTTP client",
+  "working_directory": "/ABS/PATH/TO/repo"
+}
+```
+
+**`full` — force the patch into context:**
+
+```json
+{
+  "prompt": "Fix the off-by-one in parseRange",
+  "working_directory": "/ABS/PATH/TO/repo",
+  "response_mode": "full"
+}
+```
+
+**`compact` — big refactor, patch on disk:**
+
+```json
+{
+  "prompt": "Migrate every callsite from the legacy logger",
+  "working_directory": "/ABS/PATH/TO/repo",
+  "response_mode": "compact"
+}
+```
+
+Returns:
+
+```json
+{
+  "result_version": 1,
+  "summary": "Migrated 34 callsites…",
+  "changed_files": ["src/a.ts", "src/b.ts"],
+  "diff": "",
+  "worktree_path": "/Users/you/.cache/codex-grok-mcp/worktrees/<hash>/<name>",
+  "session_id": "…",
+  "response_mode_requested": "compact",
+  "response_mode_effective": "compact",
+  "diff_included": false,
+  "diff_bytes": 284913,
+  "diff_sha256": "9f2b…",
+  "diff_stats": { "files_changed": 34, "insertions": 512, "deletions": 388 },
+  "diff_artifact_path": "/Users/you/.cache/codex-grok-mcp/diffs/<scope>/<uuid>.diff",
+  "next_actions": [
+    "Inspect changed_files under worktree_path",
+    "Read diff_artifact_path for the full redacted patch",
+    "Run independent tests before applying changes"
+  ],
+  "warnings": ["DIFF_NOT_INLINED", "DIFF_ARTIFACT_CREATED"]
+}
+```
+
+**`summary_only` — review in the worktree:**
+
+```json
+{
+  "prompt": "Reformat the whole package",
+  "working_directory": "/ABS/PATH/TO/repo",
+  "response_mode": "summary_only"
+}
+```
+
+No patch is returned and none is written — but the change is still fully
+inspectable, because the isolated worktree is kept (`keep_worktree` defaults to
+`true`). Diff it yourself:
+
+```bash
+git -C "$WORKTREE_PATH" --no-pager diff HEAD
+```
+
+> **Do not combine `summary_only` with `keep_worktree: false`.** That is the one
+> combination where nothing survives the call: no diff body, no artifact, no
+> worktree. The server flags it with `DIFF_DISCARDED_NO_ARTIFACT` and `next_actions`
+> tells you how to re-run, but the work itself is gone. Use `compact` instead —
+> its artifact outlives the reaped worktree.
+
+### Inspecting a `compact` result (Codex / Claude Code)
+
+1. Read `summary`, `changed_files` and `diff_stats` — usually enough to decide.
+2. Need specific files? Read them straight out of `worktree_path`.
+3. Need the whole patch? Read `diff_artifact_path` (already redacted, `0600`):
+
+```bash
+sed -n '1,200p' "$DIFF_ARTIFACT_PATH"
+```
+
+4. Verify integrity against `diff_sha256` before applying:
+
+```bash
+shasum -a 256 "$DIFF_ARTIFACT_PATH"
+```
+
+5. Apply as usual: `git -C <original> apply "$DIFF_ARTIFACT_PATH"`.
+6. Continue the session at a different verbosity — `response_mode` is per call:
+
+```json
+{
+  "prompt": "Also update the tests",
+  "working_directory": "/ABS/PATH/TO/repo",
+  "session_id": "…",
+  "response_mode": "full"
+}
+```
+
+### Diff artifacts
+
+- Stored under the managed cache root: `~/.cache/codex-grok-mcp/diffs/<scope_digest>/<uuid>.diff`
+  (`GROK_MCP_CACHE_DIR` moves it). `<scope_digest>` is a SHA-256 prefix of the session id
+  (or worktree path / run id) — caller input is **never** concatenated into the path.
+- Contains **only** the redacted patch: secret-path hunks are dropped and content
+  regexes applied *before* the bytes are hashed or written. An unredacted diff is
+  never written to a temp file.
+- Written atomically: `O_CREAT|O_EXCL` temp file at mode `0600` → `fsync` → `rename`.
+  Symlinked directories and pre-planted symlink targets are rejected or replaced,
+  never followed out of the cache root.
+- Each call writes a **new** UUID file. Continuing a session does not overwrite or
+  delete earlier artifacts — they are retained until TTL GC so a parent agent can
+  still read a patch it was handed several turns ago. The result always points at
+  the newest one.
+- GC'd at server start on the same TTL as worktrees (`GROK_MCP_WORKTREE_TTL_HOURS`),
+  and only for validated managed artifacts: strictly under the realpath'd artifacts
+  root, in a scope-digest directory, a regular file (never a symlink) with a managed
+  name. Unknown paths, files outside the cache root, symlinks and their targets are
+  never deleted.
 
 ## Requirements
 
@@ -160,6 +344,12 @@ The server:
 - Regex-redacts likely secrets in `summary`, stderr tails, and test output
 - Passes Grok `--deny Read(...)` rules for common secret globs
 
+Order is fixed and shared by **every** response mode: collect → drop secret-path
+hunks → apply content redaction → measure bytes / hash → pick the response mode →
+inline **or** write the artifact. `compact` re-uses the exact string `full` would
+have inlined, so it cannot bypass redaction; no unredacted diff is ever written to
+disk.
+
 This is **best-effort DLP**, not perfect secret scanning.
 
 ## Security note: `test_command` runs outside Grok's sandbox
@@ -183,17 +373,25 @@ A generated `package.json`, test file, or script in the worktree is therefore ex
 | `GROK_MCP_SANDBOX` | `workspace` | Write-mode sandbox profile |
 | `GROK_MCP_USE_GROK_WORKTREE` | `0` | Opt-in Grok `-w` path |
 | `GROK_MCP_FAIL_ON_ORIGINAL_DIRTY` | `0` | Error if original tree mutates |
-| `GROK_MCP_CACHE_DIR` | `~/.cache/codex-grok-mcp` | Sessions + worktrees |
+| `GROK_MCP_CACHE_DIR` | `~/.cache/codex-grok-mcp` | Sessions + worktrees + diff artifacts |
+| `GROK_MCP_WORKTREE_TTL_HOURS` | `72` | TTL for worktree **and** diff-artifact GC (start-up only) |
+| `GROK_MCP_INLINE_DIFF_MAX_BYTES` | `65536` | `response_mode: "auto"` inlines the diff while it is ≤ this many bytes; above it falls back to `compact`. `0` = never inline |
+| `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` | `1048576` | Absolute inline ceiling. A larger diff degrades to `compact` even for `response_mode: "full"` (warning `DIFF_HARD_LIMIT_APPLIED`) |
+
+Both byte limits accept non-negative integers up to 16 MiB. Anything else —
+negative, `NaN`, fractional, non-numeric, or over the ceiling — is **ignored**: the
+default is used and a warning is written to **stderr** at startup.
 
 ## Consumer workflow (Codex)
 
 After `grok_implement` / `grok_debug`:
 
 1. Read `worktree_path`, `changed_files`, `diff`
-2. Review the patch
-3. Apply with `git -C <original> apply` or copy files from the worktree
-4. If `warnings` includes `ORIGINAL_TREE_DIRTY`, stop auto-apply and investigate
-5. Iterate with `grok_continue` + `session_id` (does not create a new worktree)
+2. If `diff_included` is `false`, get the patch from `diff_artifact_path` or the worktree — see [Inspecting a `compact` result](#inspecting-a-compact-result-codex--claude-code)
+3. Review the patch
+4. Apply with `git -C <original> apply` or copy files from the worktree
+5. If `warnings` includes `ORIGINAL_TREE_DIRTY`, stop auto-apply and investigate
+6. Iterate with `grok_continue` + `session_id` (does not create a new worktree)
 
 ### `grok_continue` (write resume)
 
@@ -216,6 +414,9 @@ TTL GC runs **at server start only** (not after tool calls) and **only removes v
 - Session entries must have `managed === true` (pending worktrees are always server-created)
 
 Untrusted, unregistered, or outside-root paths are **never** deleted — even if `sessions.json` is malicious.
+
+Diff artifacts are GC'd in the same pass on the same TTL, with the equivalent
+validation (see [Diff artifacts](#diff-artifacts)).
 
 ## Development
 
@@ -259,6 +460,9 @@ Including schema failures from the handler’s explicit Zod `.parse` (converted 
 | Resume fails | Pass exact `session_id` from prior result; write continue needs stored **managed** same-repo registered worktree |
 | `test_command` rejected | Only valid in effective `write_worktree`; omit for analyze/review/read_only |
 | `permission_mode` / `sandbox` rejected | read_only forbids unsafe overrides (`bypassPermissions`, `off`, `workspace`, …) |
+| `diff` came back empty | Check `diff_included` / `response_mode_effective`. Read `diff_artifact_path`, or re-run with `response_mode: "full"` |
+| `DIFF_ARTIFACT_WRITE_FAILED` | Cache root not writable — check `GROK_MCP_CACHE_DIR` permissions and free space; the result degraded to `summary_only` |
+| Diff artifacts piling up | They expire on `GROK_MCP_WORKTREE_TTL_HOURS` at server start; delete `~/.cache/codex-grok-mcp/diffs` to reclaim immediately |
 | Raw `-32602` validation error | SDK rejected args before our handler; fix the field named in the message (envelope applies only after the handler runs) |
 
 ## License

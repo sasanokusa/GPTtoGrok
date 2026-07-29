@@ -565,6 +565,7 @@ interface GrokToolResult {
   result_version: 1;
   summary: string;
   changed_files: string[];
+  /** Redacted patch body; empty string when diff_included is false */
   diff: string;
   tests: TestsResult;
   session_id: string | null;
@@ -574,6 +575,15 @@ interface GrokToolResult {
   mode: "read_only" | "write_worktree";
   working_directory: string;
   effective_cwd: string;
+  // --- Response mode (additive; see "Response modes" below) ---
+  response_mode_requested: "auto" | "full" | "compact" | "summary_only";
+  response_mode_effective: "full" | "compact" | "summary_only";
+  diff_included: boolean;
+  diff_bytes: number;
+  diff_sha256: string;
+  diff_stats: { files_changed: number; insertions: number; deletions: number };
+  diff_artifact_path: string | null;
+  next_actions: string[];
   meta: {
     stop_reason?: string;
     usage?: Record<string, unknown>;
@@ -615,6 +625,105 @@ interface GrokMcpErrorBody {
 ```
 
 `meta` is **always present**. `worktree_path` and `warnings` are **first-class** (not only inside meta).
+
+The response-mode fields are likewise **first-class** rather than buried in `meta`, so a
+parent agent can branch on `diff_included` without reaching into a metadata bag.
+
+### Response modes (diff return-volume control)
+
+**Problem.** Grok Build routinely produces diffs in the hundreds of KiB. Returning the
+full patch on every call consumes MCP response budget and parent-model context even
+when the parent only needs to know *what* changed.
+
+**Decision.** Add an optional `response_mode` input to every tool. It changes only how
+much of the **already redacted** patch is transported — never what Grok is allowed to
+do, where it runs, or what is redacted.
+
+| Mode | `diff` body | Artifact | Notes |
+|------|-------------|----------|-------|
+| `auto` (default) | inlined while `diff_bytes <= GROK_MCP_INLINE_DIFF_MAX_BYTES` (64 KiB) | only on fallback | size-driven |
+| `full` | always inlined | no | subject to the hard cap below |
+| `compact` | omitted | yes | patch persisted to `diff_artifact_path` |
+| `summary_only` | omitted | no | review via `worktree_path` |
+
+`result_version` stays **1**. Every added field is additive and every pre-existing field
+keeps its type and meaning; a caller that ignores the new fields and reads `diff` behaves
+exactly as before, because the default `auto` inlines diffs up to the threshold. Bumping
+the version would have broken consumers that assert `result_version === 1` (AGENTS.md
+hard constraint 6) for no compatibility gain.
+
+#### Ordering (normative — must not be reordered)
+
+1. Collect the working-tree change set (`assembleDiff`).
+2. Drop secret-path hunks and secret paths from `changed_files`.
+3. Apply content redaction regexes; cap at `GROK_MCP_MAX_DIFF_BYTES`.
+4. Compute `diff_bytes` (UTF-8) and `diff_sha256` over the **redacted** body.
+5. Resolve `response_mode_effective`.
+6. Inline the body **or** write it to an artifact.
+
+Steps 4–6 all consume the single string produced by step 3. There is deliberately no
+second diff-collection path, so `compact` cannot bypass redaction; an unredacted diff is
+never written to a temp file.
+
+`diff_stats` is parsed from that same redacted patch (counting `diff --git` headers and
+`+`/`-` body lines) rather than scraped from `git diff --stat` text, so the numbers always
+describe exactly what was returned or stored. It can therefore report fewer files than
+`changed_files`, which also lists binary / oversized untracked files that were not patched.
+
+#### Degradation ladder (fail-closed, never "inline the raw diff")
+
+| Trigger | Result | Warning |
+|---------|--------|---------|
+| `full` (or auto→full) with `diff_bytes > GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` | → `compact`, patch stored whole (**not** truncated) | `DIFF_HARD_LIMIT_APPLIED` |
+| artifact write fails | → `summary_only`; `summary` / `changed_files` / `worktree_path` / `diff_stats` / `diff_sha256` retained | `DIFF_ARTIFACT_WRITE_FAILED` |
+
+Other warnings: `DIFF_NOT_INLINED` (non-empty patch omitted), `DIFF_ARTIFACT_CREATED`, and
+`DIFF_DISCARDED_NO_ARTIFACT` — emitted when a non-empty patch is neither inlined nor stored
+**and** `keep_worktree: false` reaps the only remaining copy. That is the single
+unrecoverable combination (`summary_only` + `keep_worktree: false`); `next_actions` switches
+to recovery instructions instead of pointing at a worktree that is about to disappear.
+`compact` is unaffected because its artifact outlives the worktree.
+
+Invalid `response_mode` values are rejected by the Zod enum and surface through the
+existing `GROK_MCP_INVALID_ARGS` envelope — no new error code. Invalid byte-limit env
+values fall back to the default with a **stderr** startup warning, matching existing
+config policy.
+
+#### Diff artifact safety
+
+Path: `<cacheDir>/diffs/<sha256(session_id ‖ worktree_path ‖ run_id)[0:16]>/<uuid v4>.diff`
+
+- Both path segments are generated (hex digest, UUID) and re-validated against strict
+  regexes; caller/Grok-supplied strings are hashed, never concatenated.
+- Artifacts root and scope directory are `realpath`'d and required to stay strictly inside
+  the cache root — a symlinked scope directory is rejected (`GROK_MCP_PATH_TRAVERSAL`).
+- Write is atomic: `O_CREAT|O_EXCL` temp at mode `0600` (refuses to follow a planted
+  symlink) → `fsync` → `rename`. `rename` replaces a symlink at the destination rather
+  than writing through it.
+- Per-call UUIDs make concurrent writes in one scope collision-free.
+
+**Retention.** Each call writes a new artifact; `grok_continue` never overwrites or deletes
+earlier ones. Chosen over eager cleanup so a parent agent can still read a patch it was
+handed several turns ago, and so a crash cannot orphan a half-deleted set. Bounded by TTL GC.
+
+**GC.** Runs at server start on `GROK_MCP_WORKTREE_TTL_HOURS`, alongside worktree GC.
+Deletes only validated managed artifacts: strictly under the realpath'd artifacts root, in a
+scope-digest directory, `isFile()` per `lstat` (never a symlink), with a managed artifact or
+temp name, older than the TTL. Emptied scope directories are `rmdir`'d non-recursively.
+Unknown paths, files outside the cache root, symlinks and their targets are never removed.
+
+#### Read-only tools
+
+`response_mode` is accepted uniformly on all five tools rather than being special-cased out
+of the read-only schemas: the field stays in one shared Zod base, and read-only runs
+normally have an empty diff so `auto` resolves to `full` (a no-op). It still governs the diff
+that an `UNEXPECTED_MUTATION` surfaces.
+
+#### `grok_continue`
+
+`response_mode` is **per call** and defaults to `auto` on every continue — it is not stored in
+the session record and not inherited. Managed-worktree validation, session mapping and
+`worktree_path` equality checks are unchanged.
 
 #### Diff algorithm (frozen v1)
 
@@ -858,6 +967,11 @@ const BaseToolInputSchema = z.object({
   sandbox: z.string().optional(),
   allow_web: z.boolean().optional().default(false),
   allow_subagents: z.boolean().optional().default(false),
+  // Diff return-volume control; accepted by every tool (see "Response modes").
+  response_mode: z
+    .enum(["auto", "full", "compact", "summary_only"])
+    .optional()
+    .default("auto"),
 });
 ```
 
@@ -935,6 +1049,11 @@ z.object({
   allow_web: z.boolean().optional().default(false),
   allow_subagents: z.boolean().optional().default(false),
   keep_worktree: z.boolean().optional().default(true),
+  // Per call; never inherited from the resumed session record.
+  response_mode: z
+    .enum(["auto", "full", "compact", "summary_only"])
+    .optional()
+    .default("auto"),
 })
 ```
 
@@ -955,6 +1074,8 @@ z.object({
 8. `session_id` is opaque; pass exact prior result id (UUID path preferred by Grok).
 9. `--restore-code` only if `restore_code: true`.
 10. Grok “session does not exist” / invalid resume → `GROK_MCP_SESSION_NOT_FOUND`.
+11. `response_mode` applies to **this** call only; omitted → `auto`. Artifacts written by
+    earlier calls in the same session are retained until TTL GC (see “Response modes”).
 
 ### MCP output registration
 
@@ -1014,8 +1135,23 @@ Session store as above. Optional config file `~/.config/codex-grok-mcp/config.js
     "Agent"
   ],
   "secretBasenames": [".env", "auth.json", "id_rsa", "id_ed25519"],
-  "secretGlobsAggressive": false
+  "secretGlobsAggressive": false,
+  "inlineDiffMaxBytes": 65536,
+  "inlineDiffHardMaxBytes": 1048576
 }
+```
+
+Both byte limits accept non-negative integers up to 16 MiB (`INLINE_DIFF_BYTES_CEILING`).
+Invalid values — negative, fractional, `NaN`, non-numeric, or over the ceiling — fall back
+to the default with a **stderr** startup warning, from both the env var and this file.
+
+**Diff artifacts** live under the same cache root as worktrees:
+
+```text
+<cacheDir>/
+├── sessions.json
+├── worktrees/<repo_hash>/<worktree_name>/
+└── diffs/<scope_digest>/<uuid>.diff      # compact-mode redacted patches (0600)
 ```
 
 ---
@@ -1276,6 +1412,7 @@ Headless docs shell tool ID: **`run_terminal_cmd`**. Getting-started: **`run_ter
 │   ├── grok-runner.ts
 │   ├── git.ts
 │   ├── worktree.ts
+│   ├── diff-artifact.ts
 │   ├── session-store.ts
 │   ├── result.ts
 │   ├── errors.ts
@@ -1376,12 +1513,21 @@ GROK_MCP_ALLOWED_ROOTS = "/Users/YOU/Documents:/Users/YOU/src"
 - argv: both shell IDs in denylist; no `-w` when resume set; `--no-auto-update` always
 - result: diff algorithm with untracked file fixture; caps
 - session-store: atomic write, corrupt recovery, lock contention
+- response-mode: auto threshold boundaries; explicit modes; hard-cap downgrade; `diff_stats` parsing; `diff_sha256` / `diff_bytes` (multi-byte safe); `next_actions`
+- diff-artifact: path stays under the cache root; non-UUID id rejected; symlinked scope dir rejected; planted symlink target untouched; `0600`; concurrent writes never collide; GC removes only managed artifacts and never symlinks / outside-root files
+- config: `GROK_MCP_INLINE_DIFF_MAX_BYTES` valid, `0`, negative, `NaN`, fractional, non-numeric, over-ceiling
+- schema: `response_mode` defaults to `auto` when omitted; invalid value → `GROK_MCP_INVALID_ARGS` envelope
 
 ### Integration (mock-grok)
 
 - scenarios: happy, error, max-turns, sleep+abort (process group), timeout from queue
 - worktree edge: missing path on continue → fail closed
 - original dirty detection with temp git repos
+- response-mode end-to-end: auto small → `full`, auto large → `compact` + artifact, explicit `full` / `compact` / `summary_only`, empty-diff zero shape, omitted field == `auto`
+- artifact integrity: stored bytes match `diff_sha256` / `diff_bytes`; secret paths and secret strings absent from the artifact
+- artifact write failure → `summary_only` degradation with `summary` / `changed_files` / `worktree_path` retained
+- continue: per-call `response_mode` override, default `auto` (not inherited), distinct artifact per call
+- read_only: pre-existing WIP still suppressed, `test_command` still rejected, `UNEXPECTED_MUTATION` still reported
 
 ### Contract
 

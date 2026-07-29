@@ -3,6 +3,15 @@ import { spawn } from "node:child_process";
 import { ZodError, type z } from "zod";
 import type { ServerConfig } from "../config.js";
 import { DEFAULT_TIMEOUTS_MS, SECRET_READ_DENY_RULES } from "../config.js";
+import {
+  buildNextActions,
+  computeDiffStats,
+  resolveEffectiveResponseMode,
+  sha256Hex,
+  writeDiffArtifact,
+  type EffectiveResponseMode,
+  type ResponseMode,
+} from "../diff-artifact.js";
 import { GrokMcpError, isGrokMcpError } from "../errors.js";
 import {
   assembleDiff,
@@ -22,7 +31,11 @@ import { logger } from "../log.js";
 import { shouldDenyRepoRootWrites } from "../path-guard.js";
 import { resolveWorkingDirectory } from "../path-guard.js";
 import { redactText } from "../redact.js";
-import { assembleResult, emptyTests } from "../result.js";
+import {
+  assembleResult,
+  emptyTests,
+  type ResponseModeResultFields,
+} from "../result.js";
 import type { SessionStore } from "../session-store.js";
 import { narrowReadOnlyTools, unionDisallowedTools } from "../tool-ids.js";
 import type {
@@ -113,6 +126,94 @@ export interface RunToolParams {
   signal?: AbortSignal;
   /** Optional warnings to merge into the result (e.g. DIFF_UNAVAILABLE from review). */
   extraWarnings?: string[];
+  /** How much diff to return. Per-call; defaults to "auto" when omitted. */
+  responseMode?: ResponseMode;
+}
+
+/**
+ * Apply the response mode to an already-redacted diff.
+ *
+ * Called with `diffAsm.diff` — the single canonical string produced by
+ * `assembleDiff` after secret-path hunk filtering and content redaction. There
+ * is no path from raw git output to an artifact: `compact` stores exactly the
+ * bytes `full` would have inlined.
+ *
+ * Degradation ladder (never inline a huge raw diff as a fallback):
+ * - `full` over the hard cap → `compact` + `DIFF_HARD_LIMIT_APPLIED`
+ * - artifact write failure → `summary_only` + `DIFF_ARTIFACT_WRITE_FAILED`
+ *   (summary / changed_files / worktree_path / stats / hash are all retained)
+ */
+export async function applyResponseMode(opts: {
+  redactedDiff: string;
+  requested: ResponseMode;
+  inlineMaxBytes: number;
+  inlineHardMaxBytes: number;
+  cacheDir: string;
+  /** Session id, worktree path or run id — hashed into the artifact directory. */
+  artifactScope: string;
+  hasWorktree: boolean;
+  /** False when `keep_worktree: false` will reap the only other copy of the change. */
+  worktreeRetained: boolean;
+  warnings: string[];
+}): Promise<{ diff: string; response: ResponseModeResultFields }> {
+  const diffBytes = Buffer.byteLength(opts.redactedDiff, "utf8");
+  const decision = resolveEffectiveResponseMode({
+    requested: opts.requested,
+    diffBytes,
+    inlineMaxBytes: opts.inlineMaxBytes,
+    inlineHardMaxBytes: opts.inlineHardMaxBytes,
+  });
+
+  let effective: EffectiveResponseMode = decision.effective;
+  if (decision.hardLimitApplied) opts.warnings.push("DIFF_HARD_LIMIT_APPLIED");
+
+  let artifactPath: string | null = null;
+  if (effective === "compact" && diffBytes > 0) {
+    try {
+      artifactPath = await writeDiffArtifact({
+        cacheDir: opts.cacheDir,
+        scope: opts.artifactScope,
+        artifactId: crypto.randomUUID(),
+        redactedDiff: opts.redactedDiff,
+      });
+      opts.warnings.push("DIFF_ARTIFACT_CREATED");
+    } catch (err) {
+      logger.warn("Failed to write diff artifact; degrading to summary_only", {
+        err: String(err),
+      });
+      opts.warnings.push("DIFF_ARTIFACT_WRITE_FAILED");
+      effective = "summary_only";
+    }
+  }
+
+  const diffIncluded = effective === "full";
+  if (!diffIncluded && diffBytes > 0) opts.warnings.push("DIFF_NOT_INLINED");
+
+  // No body, no artifact, and the worktree is about to be reaped: the change
+  // would be unrecoverable. Say so loudly rather than returning a quiet result.
+  const diffRecoverable =
+    diffIncluded ||
+    diffBytes === 0 ||
+    artifactPath !== null ||
+    opts.worktreeRetained;
+  if (!diffRecoverable) opts.warnings.push("DIFF_DISCARDED_NO_ARTIFACT");
+
+  return {
+    diff: diffIncluded ? opts.redactedDiff : "",
+    response: {
+      requested: opts.requested,
+      effective,
+      diffIncluded,
+      diffBytes,
+      diffSha256: sha256Hex(opts.redactedDiff),
+      diffStats: computeDiffStats(opts.redactedDiff),
+      diffArtifactPath: artifactPath,
+      nextActions: buildNextActions(effective, {
+        hasWorktree: opts.hasWorktree,
+        diffRecoverable,
+      }),
+    },
+  };
 }
 
 /**
@@ -689,6 +790,21 @@ export async function runTool(
     const summary = redactText(parse.text, config.maxSummaryBytes);
     const sessionId = parse.sessionId;
 
+    // Response-mode decision runs on the fully redacted diff, before any
+    // keep_worktree=false cleanup, so a compact artifact still exists after the
+    // worktree is reaped.
+    const responseMode = await applyResponseMode({
+      redactedDiff: diffAsm.diff,
+      requested: params.responseMode ?? "auto",
+      inlineMaxBytes: config.inlineDiffMaxBytes,
+      inlineHardMaxBytes: config.inlineDiffHardMaxBytes,
+      cacheDir: config.cacheDir,
+      artifactScope: sessionId ?? worktreePath ?? runId,
+      hasWorktree: Boolean(worktreePath),
+      worktreeRetained: Boolean(worktreePath) && params.keepWorktree !== false,
+      warnings,
+    });
+
     if (sessionId) {
       store.markRunning(sessionId);
       // Preserve managed / created_at / repo_root / worktree_name on resume upsert
@@ -743,7 +859,7 @@ export async function runTool(
     return assembleResult({
       summary,
       changedFiles: diffAsm.changedFiles,
-      diff: diffAsm.diff,
+      diff: responseMode.diff,
       tests,
       sessionId,
       worktreePath,
@@ -751,6 +867,7 @@ export async function runTool(
       mode,
       workingDirectory,
       effectiveCwd: inspectCwd,
+      response: responseMode.response,
       meta: {
         stop_reason: parse.stopReason,
         usage: parse.usage,

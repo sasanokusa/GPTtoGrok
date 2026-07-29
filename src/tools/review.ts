@@ -20,7 +20,7 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
     {
       title: "Grok Review (read-only by default)",
       description:
-        "Code review via Grok Build. By default injects a redacted git diff vs base_ref (default HEAD) into the prompt. read_only by default. Requires absolute working_directory. When effective mode is read_only, test_command is rejected and unsafe permission_mode/sandbox values (bypassPermissions, acceptEdits, auto, default; sandbox off|workspace) are rejected.",
+        "Code review via Grok Build. By default injects a redacted git diff vs base_ref (default HEAD) into the prompt. read_only by default. Optional response_mode (auto|full|compact|summary_only) controls how much diff the result carries. Requires absolute working_directory. When effective mode is read_only, test_command is rejected and unsafe permission_mode/sandbox values (bypassPermissions, acceptEdits, auto, default; sandbox off|workspace) are rejected.",
       inputSchema: ReviewInputSchema,
       annotations: {
         readOnlyHint: true,
@@ -82,6 +82,7 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
           sandbox: input.sandbox,
           allowWeb: input.allow_web,
           allowSubagents: input.allow_subagents,
+          responseMode: input.response_mode,
           worktreeRef: input.worktree_ref,
           worktreeName: input.worktree_name,
           keepWorktree: input.keep_worktree,

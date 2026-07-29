@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { logger } from "./log.js";
 import { DEFAULT_DISALLOWED_TOOLS, READ_ONLY_TOOLS } from "./tool-ids.js";
 
 export interface ServerConfig {
@@ -24,6 +25,10 @@ export interface ServerConfig {
   maxPromptDiffBytes: number;
   maxUntrackedFileBytes: number;
   maxStderrBytes: number;
+  /** `response_mode: "auto"` inlines the diff while it is <= this many bytes. */
+  inlineDiffMaxBytes: number;
+  /** Absolute ceiling for an inlined diff; larger bodies degrade to `compact`. */
+  inlineDiffHardMaxBytes: number;
   cacheDir: string;
   sessionStorePath: string;
   worktreesRoot: string;
@@ -52,6 +57,72 @@ function parseIntEnv(v: string | undefined, fallback: number): number {
   if (!v) return fallback;
   const n = Number.parseInt(v, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Defaults + hard ceiling for the response-mode byte limits. */
+export const DEFAULT_INLINE_DIFF_MAX_BYTES = 65_536;
+export const DEFAULT_INLINE_DIFF_HARD_MAX_BYTES = 1_048_576;
+export const INLINE_DIFF_BYTES_CEILING = 16 * 1024 * 1024;
+
+/**
+ * Byte-limit env parsing with fail-safe validation.
+ * Non-numeric, negative, fractional, NaN and out-of-range values fall back to
+ * `fallback` and emit a startup warning on **stderr** (never stdout).
+ * `0` is valid and means "never inline".
+ */
+export function parseByteLimitEnv(
+  name: string,
+  raw: string | undefined,
+  fallback: number,
+  ceiling: number,
+): number {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed === "") return fallback;
+  if (!/^\d+$/.test(trimmed)) {
+    logger.warn("Invalid byte limit; using default", {
+      env: name,
+      value: trimmed,
+      default: fallback,
+    });
+    return fallback;
+  }
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(n) || n < 0 || n > ceiling) {
+    logger.warn("Byte limit out of range; using default", {
+      env: name,
+      value: trimmed,
+      min: 0,
+      max: ceiling,
+      default: fallback,
+    });
+    return fallback;
+  }
+  return n;
+}
+
+/** Same validation for values coming from the optional JSON config file. */
+export function sanitizeByteLimit(
+  name: string,
+  value: unknown,
+  fallback: number,
+  ceiling: number,
+): number {
+  if (value === undefined) return fallback;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > ceiling
+  ) {
+    logger.warn("Invalid byte limit in config file; using default", {
+      field: name,
+      value,
+      default: fallback,
+    });
+    return fallback;
+  }
+  return value;
 }
 
 function expandHome(p: string): string {
@@ -155,6 +226,28 @@ export function loadConfig(): ServerConfig {
       524_288,
     ),
     maxStderrBytes: parseIntEnv(process.env.GROK_MCP_MAX_STDERR_BYTES, 64_000),
+    inlineDiffMaxBytes: parseByteLimitEnv(
+      "GROK_MCP_INLINE_DIFF_MAX_BYTES",
+      process.env.GROK_MCP_INLINE_DIFF_MAX_BYTES,
+      sanitizeByteLimit(
+        "inlineDiffMaxBytes",
+        fileCfg.inlineDiffMaxBytes,
+        DEFAULT_INLINE_DIFF_MAX_BYTES,
+        INLINE_DIFF_BYTES_CEILING,
+      ),
+      INLINE_DIFF_BYTES_CEILING,
+    ),
+    inlineDiffHardMaxBytes: parseByteLimitEnv(
+      "GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES",
+      process.env.GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES,
+      sanitizeByteLimit(
+        "inlineDiffHardMaxBytes",
+        fileCfg.inlineDiffHardMaxBytes,
+        DEFAULT_INLINE_DIFF_HARD_MAX_BYTES,
+        INLINE_DIFF_BYTES_CEILING,
+      ),
+      INLINE_DIFF_BYTES_CEILING,
+    ),
     cacheDir,
     sessionStorePath: path.join(cacheDir, "sessions.json"),
     worktreesRoot: path.join(cacheDir, "worktrees"),
