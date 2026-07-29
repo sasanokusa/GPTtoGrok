@@ -43,4 +43,47 @@ describe("SessionStore", () => {
     const backups = fs.readdirSync(dir).filter((f) => f.includes("corrupt"));
     expect(backups.length).toBeGreaterThan(0);
   });
+
+  it("preserves managed session metadata across upsert overwrite", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cgm-ss-"));
+    tmpDirs.push(dir);
+    const store = new SessionStore(path.join(dir, "sessions.json"), 10);
+    const createdAt = "2020-01-01T00:00:00.000Z";
+    await store.upsert("s-managed", {
+      mode: "write_worktree",
+      repo_root: "/repo",
+      original_cwd: "/repo",
+      worktree_path: "/cache/worktrees/abc/s1",
+      worktree_name: "s1",
+      managed: true,
+      created_at: createdAt,
+      last_used_at: createdAt,
+      tool: "grok_implement",
+    });
+
+    const prior = await store.get("s-managed");
+    expect(prior?.managed).toBe(true);
+    expect(prior?.worktree_path).toBe("/cache/worktrees/abc/s1");
+    expect(prior?.created_at).toBe(createdAt);
+
+    // Simulate resume upsert that preserves managed metadata from prior.
+    await store.upsert("s-managed", {
+      mode: "write_worktree",
+      repo_root: prior!.repo_root,
+      original_cwd: prior!.original_cwd,
+      worktree_path: prior!.worktree_path,
+      worktree_name: prior!.worktree_name,
+      managed: prior!.managed ?? false,
+      created_at: prior!.created_at,
+      last_used_at: new Date().toISOString(),
+      tool: "grok_continue",
+    });
+
+    const after = await store.get("s-managed");
+    expect(after?.managed).toBe(true);
+    expect(after?.worktree_path).toBe("/cache/worktrees/abc/s1");
+    expect(after?.worktree_name).toBe("s1");
+    expect(after?.created_at).toBe(createdAt);
+    expect(after?.tool).toBe("grok_continue");
+  });
 });

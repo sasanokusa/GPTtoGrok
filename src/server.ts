@@ -48,6 +48,8 @@ export function createServer(config: ServerConfig): McpServer {
   // Best-effort GC on start — only managed paths under worktreesRoot that are
   // registered to the repo. Never recursively remove caller-controlled or
   // unregistered paths, even if sessions.json is malicious.
+  // Session entries must be managed===true; pending_worktrees are always
+  // server-created and may be reaped without a managed flag.
   void store
     .gc(config.worktreeTtlHours, async (entry) => {
       const wtPath =
@@ -56,9 +58,24 @@ export function createServer(config: ServerConfig): McpServer {
           : undefined;
       const repo =
         "repo_root" in entry && entry.repo_root ? entry.repo_root : undefined;
-      if (wtPath && repo) {
-        await removeWorktree(repo, wtPath, config.worktreesRoot);
+      if (!wtPath || !repo) return;
+
+      const isSession =
+        "session_id" in entry ||
+        ("managed" in entry && !("run_id" in entry));
+      if (isSession) {
+        const managed =
+          "managed" in entry ? (entry as { managed?: boolean }).managed : undefined;
+        if (managed !== true) {
+          logger.warn("Refusing GC of non-managed session worktree", {
+            worktree_path: wtPath,
+            repo_root: repo,
+          });
+          return;
+        }
       }
+
+      await removeWorktree(repo, wtPath, config.worktreesRoot);
     })
     .then((n) => {
       if (n > 0) logger.info("GC removed stale worktrees", { count: n });

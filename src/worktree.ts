@@ -361,9 +361,15 @@ export async function removeWorktree(
       120_000,
     );
     if (r.exitCode !== 0) {
-      // best-effort force remove directory + prune — still only the verified path
-      await fs.rm(check.realPath, { recursive: true, force: true });
-      await runGit(["worktree", "prune"], check.realRepo);
+      // Re-check immediately before recursive rm (TOCTOU defense)
+      const again = await isSafeManagedWorktreeForRemoval(
+        check.realPath,
+        check.realRepo,
+        worktreesRoot,
+      );
+      if (!again.safe) return;
+      await fs.rm(again.realPath, { recursive: true, force: true });
+      await runGit(["worktree", "prune"], again.realRepo);
     }
   } catch (err) {
     logger.warn("worktree remove failed", {
@@ -371,7 +377,7 @@ export async function removeWorktree(
       err: String(err),
     });
     try {
-      // Re-check before recursive rm (TOCTOU defense)
+      // Re-check immediately before recursive rm (TOCTOU defense)
       const again = await isSafeManagedWorktreeForRemoval(
         check.realPath,
         check.realRepo,

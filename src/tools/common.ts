@@ -293,9 +293,21 @@ export async function runTool(
     let useGrokWorktree =
       params.useGrokWorktree ?? config.useGrokWorktree ?? false;
 
+    // Load prior resume record before runtime worktree setup / cleanup / upsert
+    // so managed metadata is preserved across continue (including keepWorktree=false).
+    const prior = params.resumeSessionId
+      ? await store.get(params.resumeSessionId)
+      : undefined;
+
     // Continue / resume path
     if (params.resumeSessionId) {
       useGrokWorktree = false; // never -w on continue
+      if (prior?.managed === true) {
+        managed = true;
+      }
+      if (prior?.worktree_name && !worktreeName) {
+        worktreeName = prior.worktree_name;
+      }
     }
 
     if (mode === "write_worktree") {
@@ -316,6 +328,8 @@ export async function runTool(
         // Resolve worktree for continue
         if (params.worktreePathOverride) {
           worktreePath = params.worktreePathOverride;
+        } else if (prior?.worktree_path) {
+          worktreePath = prior.worktree_path;
         }
         if (!worktreePath || !(await pathExists(worktreePath))) {
           throw new GrokMcpError(
@@ -525,9 +539,6 @@ export async function runTool(
     if (sessionId) {
       store.markRunning(sessionId);
       // Preserve managed / created_at / repo_root / worktree_name on resume upsert
-      const prior = params.resumeSessionId
-        ? await store.get(params.resumeSessionId)
-        : undefined;
       await store.upsert(sessionId, {
         mode,
         repo_root: prior?.repo_root ?? repoRoot ?? workingDirectory,
@@ -545,7 +556,8 @@ export async function runTool(
 
     await store.removePending(runId);
 
-    // Optional cleanup — only managed paths under worktreesRoot
+    // Optional cleanup — only managed paths under worktreesRoot.
+    // On resume, `managed` is restored from the prior session record above.
     if (
       params.keepWorktree === false &&
       worktreePath &&
