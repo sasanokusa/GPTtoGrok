@@ -702,8 +702,10 @@ false`, warning `DIFF_TRUNCATED`) so a cut patch is never presented as applyable
 
 #### `diff_complete` (normative)
 
-`assembleDiff` returns `complete: false` whenever a detected change is dropped from the
-patch: secret paths / hunks, a **tracked binary** whose `git diff HEAD` output is only a
+`assembleDiff` returns `complete: false` whenever a detected change is dropped **or
+rewritten** out of the patch: secret paths / hunks (`REDACTED_SECRET_PATHS`), **content
+redaction** that substituted secret-like substrings with `[REDACTED]`
+(`REDACTED_SECRET_CONTENT`), a **tracked binary** whose `git diff HEAD` output is only a
 `Binary files … differ` marker (no payload — see below), an untracked file over
 `GROK_MCP_MAX_UNTRACKED_FILE_BYTES`, a binary or unreadable untracked file, or a path that
 escaped the repo root. The response stage ANDs that with "not truncated" to produce
@@ -714,6 +716,18 @@ entry in `next_actions` (when `diff_bytes > 0`; an empty patch yields `next_acti
 `diff_included`, so a `compact` artifact is labelled just as honestly as an inlined body.
 An empty tree (or a non-git directory) is vacuously complete — nothing was detected, so
 nothing was omitted.
+
+**Content redaction (fail-closed, intentionally noisy).** Final assembly runs
+`redactTextWithFlag` over the concatenated patch. When any `SECRET_CONTENT_PATTERNS`
+match fires, the returned bytes no longer reproduce the change — a content-redacted
+patch can `git apply` with silently wrong or syntactically broken content, which is
+worse than a visibly omitted file. The assembly therefore sets `complete: false` and
+emits `REDACTED_SECRET_CONTENT` (distinct from path-level `REDACTED_SECRET_PATHS`).
+One of the patterns is deliberately broad
+(`password|passwd|secret|token|api[_-]?key` followed by a value of length ≥ 8), so
+ordinary source such as `token: someIdentifier` will trip it. That is intended: callers
+must not blind-apply; reconcile against `worktree_path`. Patterns must **not** be
+narrowed to reduce the false-positive rate — secrecy beats apply convenience.
 
 **Tracked binaries (deliberate fail-closed).** `git diff HEAD` without `--binary` emits
 only a header plus `Binary files a/path and b/path differ` (or `/dev/null` for
@@ -813,7 +827,7 @@ Run in `effective_cwd` (worktree or original). Output must be **`git apply`-frie
        ```
        for new files (`relpath` POSIX separators, no leading `./`).
      - Never leave absolute host paths in the returned `diff` string.
-5. Concatenate tracked + normalized untracked patches; content redaction regex. **No byte cap** — `assembleDiff` returns the whole redacted patch plus `complete: boolean`. Return-volume control is the response-mode stage's job (see "Response modes"); the only remaining truncation is the opt-in `GROK_MCP_MAX_DIFF_BYTES` cap applied there, which reports itself via `diff_truncated` / `original_diff_bytes`.
+5. Concatenate tracked + normalized untracked patches; run `redactTextWithFlag` (content redaction regex). If any substitution fired → `complete: false` + warning `REDACTED_SECRET_CONTENT` (distinct from path-level `REDACTED_SECRET_PATHS`). **No byte cap** — `assembleDiff` returns the whole redacted patch plus `complete: boolean`. Return-volume control is the response-mode stage's job (see "Response modes"); the only remaining truncation is the opt-in `GROK_MCP_MAX_DIFF_BYTES` cap applied there, which reports itself via `diff_truncated` / `original_diff_bytes`.
 6. **Do not** mutate the index (`git add -N` forbidden in v1).
 7. **Unit test (required)**: create temp repo + untracked file → assemble `diff` → `git apply` into a second clean worktree/clone of the same commit → file content matches.
 
@@ -1597,7 +1611,7 @@ GROK_MCP_ALLOWED_ROOTS = "/Users/YOU/Documents:/Users/YOU/src"
 - artifact write failure → `summary_only` degradation with `summary` / `changed_files` / `worktree_path` retained
 - continue: per-call `response_mode` override, default `auto` (not inherited), distinct artifact per call
 - read_only: pre-existing WIP still suppressed, `test_command` still rejected, `UNEXPECTED_MUTATION` still reported
-- diff completeness: a >1 MiB patch is neither truncated nor cut in the artifact; secret-path omission and an oversized untracked file both yield `diff_complete: false`; the opt-in cap sets `diff_truncated` + `original_diff_bytes` and the stored bytes still match `diff_sha256`
+- diff completeness: a >1 MiB patch is neither truncated nor cut in the artifact; secret-path omission, **content redaction** (`REDACTED_SECRET_CONTENT`), and an oversized untracked file all yield `diff_complete: false`; the opt-in cap sets `diff_truncated` + `original_diff_bytes` and the stored bytes still match `diff_sha256`
 - test output: `compact` + passing `test_command` returns a small `tests.output` (outcome budget, not mode) so the total MCP response stays bounded
 
 ### Contract

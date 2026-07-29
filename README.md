@@ -138,6 +138,7 @@ out, and the patch will not reproduce the change on its own:
 | Cause | Warning |
 |-------|---------|
 | secret paths / hunks removed before the patch was assembled | `REDACTED_SECRET_PATHS` |
+| content redaction rewrote bytes in the patch (`[REDACTED]`) | `REDACTED_SECRET_CONTENT` |
 | untracked file above `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` (never read into memory) | `UNTRACKED_TOO_LARGE` |
 | binary file (tracked: git emits only a `Binary files … differ` marker; untracked: skipped by NUL sniff) or unreadable untracked file | `BINARY_SKIPPED` / `UNTRACKED_DIFF_FAILED` |
 | an opt-in absolute cap cut the body | `DIFF_TRUNCATED` (with `diff_truncated: true`) |
@@ -145,6 +146,13 @@ out, and the patch will not reproduce the change on its own:
 Any of these also raise `DIFF_INCOMPLETE` and put a `Do not apply the patch as-is`
 hint first in `next_actions` (when there is a non-empty patch to warn about).
 Reconcile against `worktree_path` instead.
+
+**Content redaction is deliberately broad and fail-closed.** Patterns match
+things like `token: someIdentifier` or `secret = configValue` as well as real
+keys, so `diff_complete: false` + `REDACTED_SECRET_CONTENT` will show up on many
+ordinary code diffs. That is intended: the flag means *these bytes were rewritten,
+so do not `git apply` this patch blind — reconcile against `worktree_path`*.
+Patterns are not narrowed to reduce noise (AGENTS.md #2).
 
 ### Warnings
 
@@ -157,6 +165,8 @@ Reconcile against `worktree_path` instead.
 | `DIFF_HARD_LIMIT_APPLIED` | `full` exceeded `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` and was degraded to `compact` — the patch is **not** truncated, it is stored whole |
 | `DIFF_ARTIFACT_WRITE_FAILED` | the artifact could not be written; the call degrades to `summary_only` rather than inlining a huge patch. `summary`, `changed_files`, `worktree_path`, `diff_stats` and `diff_sha256` are still returned |
 | `DIFF_DISCARDED_NO_ARTIFACT` | no diff body, no artifact **and** `keep_worktree: false` — the patch is unrecoverable after this call. `next_actions` tells you how to re-run |
+| `REDACTED_SECRET_PATHS` | secret-path files / hunks were dropped from the assembled patch |
+| `REDACTED_SECRET_CONTENT` | content-redaction regexes rewrote bytes in the patch (`[REDACTED]`); the body is no longer a faithful applyable patch. Can fire on innocuous code that matches the broad patterns — fail-closed by design |
 
 ### Examples
 
@@ -403,7 +413,7 @@ The server:
 - Does not load project `.env` into the child environment
 - Filters secret basenames (`.env`, `*.pem`, `id_rsa`, `auth.json`, …) from `changed_files`
 - **Omits whole-file secret-path hunks** from result `diff` and from **review-injected** `git diff` / `--stat` (pathspecs + hunk/stat filters; warning `REDACTED_SECRET_PATHS` when result paths are dropped)
-- Regex-redacts likely secrets in `summary`, stderr tails, and test output
+- Regex-redacts likely secrets in result `diff`, `summary`, stderr tails, and test output; when the **result** patch is rewritten, also sets `diff_complete: false` + `REDACTED_SECRET_CONTENT` (patterns stay broad — fail-closed, can trip on ordinary identifiers)
 - Passes Grok `--deny Read(...)` rules for common secret globs
 
 Order is fixed and shared by **every** response mode: collect → drop secret-path

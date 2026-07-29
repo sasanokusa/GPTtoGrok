@@ -711,6 +711,29 @@ echo "export const n = 1;" > app.ts`,
     expect(r.next_actions.join(" ")).toContain("Do not apply");
   });
 
+  it("marks a diff incomplete when content redaction rewrote the patch body", async () => {
+    const repo = initRepo();
+    const ctx = makeCtx(makeConfig());
+    // Obviously fake credential — patterns will substitute it with [REDACTED].
+    const fakeSecret = "sk-abcdefghijklmnopqrstuvwxyz";
+    const r = await implement({
+      ctx,
+      repo,
+      grokBin: writeMockGrok(
+        `printf '%s\\n' 'export const apiKey = "${fakeSecret}";' > app.ts`,
+      ),
+      responseMode: "full",
+    });
+
+    expect(r.diff_complete).toBe(false);
+    expect(r.warnings).toContain("REDACTED_SECRET_CONTENT");
+    expect(r.warnings).toContain("DIFF_INCOMPLETE");
+    expect(r.diff_truncated).toBe(false);
+    expect(r.diff).toContain("[REDACTED]");
+    expect(r.diff).not.toContain(fakeSecret);
+    expect(r.next_actions[0]).toMatch(/Do not apply/i);
+  });
+
   it("opt-in cap truncates, reports the original size, and refuses to claim completeness", async () => {
     const repo = initRepo();
     const ctx = makeCtx(makeConfig({ maxDiffBytes: 4096 }));

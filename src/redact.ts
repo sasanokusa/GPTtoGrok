@@ -71,12 +71,26 @@ export function filterSecretPaths(
   return { kept, redacted };
 }
 
-export function redactText(text: string, maxBytes?: number): string {
+/**
+ * Content redaction with a substitution flag.
+ *
+ * `redacted` is true only when a {@link SECRET_CONTENT_PATTERNS} match was
+ * rewritten to `[REDACTED]`. Optional `maxBytes` truncation (which appends
+ * `... [truncated]`) is a separate concern and does **not** set the flag —
+ * callers that need completeness for applyable patches should not pass a cap.
+ */
+export function redactTextWithFlag(
+  text: string,
+  maxBytes?: number,
+): { text: string; redacted: boolean } {
   let out = text;
+  let redacted = false;
   for (const re of SECRET_CONTENT_PATTERNS) {
-    // Reset lastIndex for global patterns
+    // Reset lastIndex for global patterns so repeated calls are deterministic.
     re.lastIndex = 0;
-    out = out.replace(re, "[REDACTED]");
+    const next = out.replace(re, "[REDACTED]");
+    if (next !== out) redacted = true;
+    out = next;
   }
   if (maxBytes != null && Buffer.byteLength(out, "utf8") > maxBytes) {
     // Truncate by code units carefully
@@ -86,7 +100,11 @@ export function redactText(text: string, maxBytes?: number): string {
     }
     out = `${truncated}\n... [truncated]`;
   }
-  return out;
+  return { text: out, redacted };
+}
+
+export function redactText(text: string, maxBytes?: number): string {
+  return redactTextWithFlag(text, maxBytes).text;
 }
 
 /** Strip absolute host paths that might appear in diffs (defense in depth). */

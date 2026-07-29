@@ -140,7 +140,33 @@ describe("assembleDiff", () => {
 
     expect(result.complete).toBe(true);
     expect(result.warnings).not.toContain("BINARY_SKIPPED");
+    expect(result.warnings).not.toContain("REDACTED_SECRET_CONTENT");
     expect(result.diff).toContain("hello world");
+  });
+
+  it("marks complete=false when content redaction rewrites a tracked change", async () => {
+    const repo = initRepo();
+    // Obviously fake credential — must not survive in the assembled patch.
+    const fakeSecret = "sk-abcdefghijklmnopqrstuvwxyz";
+    fs.writeFileSync(
+      path.join(repo, "app.ts"),
+      `export const apiKey = "${fakeSecret}";\n`,
+    );
+    execFileSync("git", ["add", "app.ts"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "add app"], { cwd: repo });
+    fs.writeFileSync(
+      path.join(repo, "app.ts"),
+      `export const apiKey = "${fakeSecret}";\nexport const n = 2;\n`,
+    );
+
+    const result = await assembleDiff(repo, secretCfg, { maxUntrackedFileBytes: 500_000 });
+
+    expect(result.complete).toBe(false);
+    expect(result.warnings).toContain("REDACTED_SECRET_CONTENT");
+    expect(result.warnings).not.toContain("REDACTED_SECRET_PATHS");
+    expect(result.diff).toContain("[REDACTED]");
+    expect(result.diff).not.toContain(fakeSecret);
+    expect(result.changedFiles).toContain("app.ts");
   });
 
   it("does not treat a text line containing the binary marker as incomplete", async () => {

@@ -4,6 +4,7 @@ import {
   filterSecretPaths,
   isSecretPath,
   redactText,
+  redactTextWithFlag,
 } from "../../src/redact.js";
 
 const cfg = {
@@ -40,6 +41,46 @@ describe("redact", () => {
     const out = redactText(text);
     expect(out).toContain("[REDACTED]");
     expect(out).not.toMatch(/sk-abcdefgh/);
+  });
+
+  it("redactTextWithFlag reports content substitution", () => {
+    const dirty =
+      "key=sk-abcdefghijklmnopqrstuvwxyz token Bearer abcdefghijklmnopqrstuvwxyz1234";
+    const clean = "export const n = 1;\nhello world\n";
+
+    const dirtyFlag = redactTextWithFlag(dirty);
+    expect(dirtyFlag.redacted).toBe(true);
+    expect(dirtyFlag.text).toContain("[REDACTED]");
+    expect(dirtyFlag.text).not.toMatch(/sk-abcdefgh/);
+    // Wrapper compatibility: same bytes as redactText.
+    expect(redactText(dirty)).toBe(dirtyFlag.text);
+
+    const cleanFlag = redactTextWithFlag(clean);
+    expect(cleanFlag.redacted).toBe(false);
+    expect(cleanFlag.text).toBe(clean);
+    expect(redactText(clean)).toBe(clean);
+  });
+
+  it("redactTextWithFlag does not leak global-regex lastIndex across calls", () => {
+    const dirty = "sk-abcdefghijklmnopqrstuvwxyz";
+    const a = redactTextWithFlag(dirty);
+    const b = redactTextWithFlag(dirty);
+    expect(a).toEqual(b);
+    expect(a.redacted).toBe(true);
+    expect(a.text).toBe("[REDACTED]");
+
+    const clean = "no secrets here at all";
+    expect(redactTextWithFlag(clean)).toEqual({ text: clean, redacted: false });
+    // After a clean call, dirty still redacts the same way.
+    expect(redactTextWithFlag(dirty)).toEqual(a);
+  });
+
+  it("maxBytes truncation does not set the redacted flag by itself", () => {
+    const clean = "a".repeat(200);
+    const r = redactTextWithFlag(clean, 40);
+    expect(r.redacted).toBe(false);
+    expect(r.text).toContain("... [truncated]");
+    expect(redactText(clean, 40)).toBe(r.text);
   });
 });
 

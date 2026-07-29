@@ -4,7 +4,12 @@ import path from "node:path";
 import { GrokMcpError } from "./errors.js";
 import { scrubEnv } from "./grok-runner.js";
 import type { RedactConfig } from "./redact.js";
-import { filterSecretPaths, isSecretPath, redactText } from "./redact.js";
+import {
+  filterSecretPaths,
+  isSecretPath,
+  redactText,
+  redactTextWithFlag,
+} from "./redact.js";
 
 export interface RunGitResult {
   stdout: string;
@@ -536,7 +541,15 @@ export async function assembleDiff(
 
   // Content redaction is the last transform; the result is the canonical patch
   // that response_mode either inlines verbatim or writes to an artifact.
-  const diff = redactText(diffParts.join(""));
+  // If any SECRET_CONTENT_PATTERNS substitution fired, the patch no longer
+  // reproduces the change — fail closed (do not claim applyable completeness).
+  const { text: diff, redacted: contentRedacted } = redactTextWithFlag(
+    diffParts.join(""),
+  );
+  if (contentRedacted) {
+    warnings.push("REDACTED_SECRET_CONTENT");
+    omitted = true;
+  }
 
   return {
     changedFiles: kept,
