@@ -1,0 +1,47 @@
+# Merge into ~/.codex/config.toml (path may vary by Codex version).
+#
+# CRITICAL: Codex / MCP hosts often default per-tool timeouts to ~60s.
+# Grok implement/debug runs routinely need 10–30+ minutes. Without raising
+# tool_timeout_sec, Codex will cancel the MCP call before Grok finishes.
+#
+# Interaction: Codex timeout → cancel notification / AbortSignal → MCP server
+# SIGTERM/SIGKILL on the Grok process group. Server-side timeout_ms also applies
+# (queue + run). Set host timeout HIGHER than the longest tool default (30m)
+# plus buffer.
+
+[mcp_servers.codex-grok]
+command = "node"
+# Use the absolute path to this repo's built entrypoint:
+args = ["/ABSOLUTE/PATH/TO/GPTtoGrok/dist/index.js"]
+# Or after global install: command = "codex-grok-mcp" with args = []
+
+# Server process start (cold Node import). Default is often ~10s.
+startup_timeout_sec = 30
+
+# Per MCP tool call. 2400s = 40 minutes (>= 30m implement default + buffer).
+tool_timeout_sec = 2400
+
+# If your Codex build supports per-tool overrides, prefer:
+# tool_timeouts = { grok_implement = 2400, grok_debug = 2400, grok_analyze = 900, grok_review = 900, grok_continue = 1500 }
+
+# Approval: write tools are destructive (isolated worktree). Prefer auto-allow
+# for this trusted local server, or confirm per your security posture.
+# default_tools_approval_mode = "approve"
+
+enabled = true
+
+[mcp_servers.codex-grok.env]
+GROK_MCP_LOG_LEVEL = "info"
+# GROK_MCP_GROK_BIN = "/Users/YOU/.grok/bin/grok"
+# Tighten path allowlist (recommended). Colon-separated absolute roots:
+# GROK_MCP_ALLOWED_ROOTS = "/Users/YOU/Documents:/Users/YOU/src"
+# Optional isolation hardening / opt-in weaker Grok -w path:
+# GROK_MCP_SANDBOX = "workspace"
+# GROK_MCP_USE_GROK_WORKTREE = "1"
+# GROK_MCP_FAIL_ON_ORIGINAL_DIRTY = "1"
+
+# If Codex scrubs the parent environment when spawning MCP servers, explicitly
+# forward vars Grok needs (names depend on host policy):
+# HOME = "/Users/YOU"
+# PATH = "/usr/bin:/bin:/Users/YOU/.grok/bin"
+# Prefer Grok's own ~/.grok/auth.json over injecting API keys here.
