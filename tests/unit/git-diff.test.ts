@@ -44,7 +44,7 @@ describe("assembleDiff", () => {
     const asm = assembleDiff(
       repo,
       { secretBasenames: [".env"], aggressive: false },
-      { maxDiffBytes: 1_000_000, maxUntrackedFileBytes: 500_000 },
+      { maxUntrackedFileBytes: 500_000 },
     );
 
     return asm.then((result) => {
@@ -72,7 +72,7 @@ describe("assembleDiff", () => {
     const result = await assembleDiff(
       repo,
       { secretBasenames: [".env"], aggressive: false },
-      { maxDiffBytes: 1_000_000, maxUntrackedFileBytes: 500_000 },
+      { maxUntrackedFileBytes: 500_000 },
     );
     expect(result.changedFiles).toContain("ok.ts");
     expect(result.changedFiles).not.toContain(".env");
@@ -99,10 +99,7 @@ describe("assembleDiff", () => {
     );
     fs.writeFileSync(path.join(repo, "app.ts"), "export const n = 2;\n");
 
-    const result = await assembleDiff(repo, secretCfg, {
-      maxDiffBytes: 1_000_000,
-      maxUntrackedFileBytes: 500_000,
-    });
+    const result = await assembleDiff(repo, secretCfg, { maxUntrackedFileBytes: 500_000 });
 
     expect(result.changedFiles).toContain("app.ts");
     expect(result.changedFiles).not.toContain(".env");

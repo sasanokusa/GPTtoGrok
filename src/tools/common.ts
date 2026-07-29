@@ -4,6 +4,7 @@ import { ZodError, type z } from "zod";
 import type { ServerConfig } from "../config.js";
 import { DEFAULT_TIMEOUTS_MS, SECRET_READ_DENY_RULES } from "../config.js";
 import {
+  applyAbsoluteDiffCap,
   buildNextActions,
   computeDiffStats,
   resolveEffectiveResponseMode,
@@ -138,6 +139,12 @@ export interface RunToolParams {
  * is no path from raw git output to an artifact: `compact` stores exactly the
  * bytes `full` would have inlined.
  *
+ * Order is fixed and single-pass: cap (opt-in, off by default) → mode decision →
+ * inline or artifact. Only the cap may alter the patch, and when it does the
+ * result reports `diff_truncated: true` / `diff_complete: false` so a cut patch
+ * is never mistaken for an applyable one. Oversize alone never truncates — it
+ * moves the patch to an artifact.
+ *
  * Degradation ladder (never inline a huge raw diff as a fallback):
  * - `full` over the hard cap → `compact` + `DIFF_HARD_LIMIT_APPLIED`
  * - artifact write failure → `summary_only` + `DIFF_ARTIFACT_WRITE_FAILED`
@@ -145,9 +152,13 @@ export interface RunToolParams {
  */
 export async function applyResponseMode(opts: {
   redactedDiff: string;
+  /** False when collection dropped changes (secret paths, binary/oversized untracked). */
+  sourceComplete: boolean;
   requested: ResponseMode;
   inlineMaxBytes: number;
   inlineHardMaxBytes: number;
+  /** Opt-in absolute cap on the patch body; `0` (default) means unlimited. */
+  absoluteMaxBytes: number;
   cacheDir: string;
   /** Session id, worktree path or run id — hashed into the artifact directory. */
   artifactScope: string;
@@ -156,7 +167,15 @@ export async function applyResponseMode(opts: {
   worktreeRetained: boolean;
   warnings: string[];
 }): Promise<{ diff: string; response: ResponseModeResultFields }> {
-  const diffBytes = Buffer.byteLength(opts.redactedDiff, "utf8");
+  // Absolute cap first, so every downstream number (bytes, hash, stats) describes
+  // the exact body that is returned or stored.
+  const capped = applyAbsoluteDiffCap(opts.redactedDiff, opts.absoluteMaxBytes);
+  const body = capped.diff;
+  if (capped.truncated) opts.warnings.push("DIFF_TRUNCATED");
+  const diffComplete = opts.sourceComplete && !capped.truncated;
+  if (!diffComplete) opts.warnings.push("DIFF_INCOMPLETE");
+
+  const diffBytes = Buffer.byteLength(body, "utf8");
   const decision = resolveEffectiveResponseMode({
     requested: opts.requested,
     diffBytes,
@@ -174,7 +193,7 @@ export async function applyResponseMode(opts: {
         cacheDir: opts.cacheDir,
         scope: opts.artifactScope,
         artifactId: crypto.randomUUID(),
-        redactedDiff: opts.redactedDiff,
+        redactedDiff: body,
       });
       opts.warnings.push("DIFF_ARTIFACT_CREATED");
     } catch (err) {
@@ -199,18 +218,24 @@ export async function applyResponseMode(opts: {
   if (!diffRecoverable) opts.warnings.push("DIFF_DISCARDED_NO_ARTIFACT");
 
   return {
-    diff: diffIncluded ? opts.redactedDiff : "",
+    diff: diffIncluded ? body : "",
     response: {
       requested: opts.requested,
       effective,
       diffIncluded,
       diffBytes,
-      diffSha256: sha256Hex(opts.redactedDiff),
-      diffStats: computeDiffStats(opts.redactedDiff),
+      diffSha256: sha256Hex(body),
+      diffStats: computeDiffStats(body),
       diffArtifactPath: artifactPath,
+      diffComplete,
+      diffTruncated: capped.truncated,
+      ...(capped.originalBytes !== undefined
+        ? { originalDiffBytes: capped.originalBytes }
+        : {}),
       nextActions: buildNextActions(effective, {
         hasWorktree: opts.hasWorktree,
         diffRecoverable,
+        diffComplete,
       }),
     },
   };
@@ -521,7 +546,6 @@ export async function runTool(
       aggressive: config.secretGlobsAggressive,
     };
     const diffOpts = {
-      maxDiffBytes: config.maxDiffBytes,
       maxUntrackedFileBytes: config.maxUntrackedFileBytes,
     };
 
@@ -715,8 +739,14 @@ export async function runTool(
         warnings.push("UNEXPECTED_MUTATION");
       }
       if (decision.useEmptyDiff) {
-        // Do not surface the caller's pre-existing uncommitted work.
-        diffAsm = { changedFiles: [], diff: "", warnings: diffAsm.warnings };
+        // Do not surface the caller's pre-existing uncommitted work. Suppressing
+        // an unchanged baseline is not an omission: the run itself changed nothing.
+        diffAsm = {
+          changedFiles: [],
+          diff: "",
+          warnings: diffAsm.warnings,
+          complete: true,
+        };
       }
     }
 
@@ -795,9 +825,11 @@ export async function runTool(
     // worktree is reaped.
     const responseMode = await applyResponseMode({
       redactedDiff: diffAsm.diff,
+      sourceComplete: diffAsm.complete,
       requested: params.responseMode ?? "auto",
       inlineMaxBytes: config.inlineDiffMaxBytes,
       inlineHardMaxBytes: config.inlineDiffHardMaxBytes,
+      absoluteMaxBytes: config.maxDiffBytes,
       cacheDir: config.cacheDir,
       artifactScope: sessionId ?? worktreePath ?? runId,
       hasWorktree: Boolean(worktreePath),

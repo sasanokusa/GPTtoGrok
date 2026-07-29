@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyAbsoluteDiffCap,
   buildNextActions,
   computeDiffStats,
   resolveEffectiveResponseMode,
@@ -170,7 +171,11 @@ describe("sha256Hex", () => {
 });
 
 describe("buildNextActions", () => {
-  const recoverable = { hasWorktree: true, diffRecoverable: true };
+  const recoverable = {
+    hasWorktree: true,
+    diffRecoverable: true,
+    diffComplete: true,
+  };
 
   it("is empty for full (no extra boilerplate per call)", () => {
     expect(buildNextActions("full", recoverable)).toEqual([]);
@@ -187,20 +192,94 @@ describe("buildNextActions", () => {
     const actions = buildNextActions("summary_only", {
       hasWorktree: false,
       diffRecoverable: true,
+      diffComplete: true,
     });
     expect(actions[0]).toContain("effective_cwd");
     expect(actions[1]).toContain("response_mode");
+  });
+
+  it("warns against applying an incomplete patch, even in full", () => {
+    const actions = buildNextActions("full", { ...recoverable, diffComplete: false });
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toContain("diff_complete");
+    expect(actions[0]).toContain("Do not apply");
+  });
+
+  it("keeps the incomplete warning first in compact", () => {
+    const actions = buildNextActions("compact", {
+      ...recoverable,
+      diffComplete: false,
+    });
+    expect(actions[0]).toContain("diff_complete");
+    // The artifact holds a partial patch — say so rather than calling it full.
+    expect(actions.join(" ")).toContain("partial redacted patch");
   });
 
   it("tells the caller how to recover when nothing survives the call", () => {
     const actions = buildNextActions("summary_only", {
       hasWorktree: true,
       diffRecoverable: false,
+      diffComplete: true,
     });
     expect(actions).toHaveLength(2);
     expect(actions[0]).toContain("response_mode");
     expect(actions[1]).toContain("keep_worktree");
     // Must not point at a worktree that is about to be removed.
     expect(actions.join(" ")).not.toContain("Inspect changed_files");
+  });
+});
+
+describe("applyAbsoluteDiffCap", () => {
+  const patch = "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n+one\n+two\n+three\n";
+
+  it("is disabled by default (0 = unlimited): a huge diff passes through untouched", () => {
+    const huge = "x".repeat(5_000_000);
+    const r = applyAbsoluteDiffCap(huge, 0);
+    expect(r.truncated).toBe(false);
+    expect(r.diff).toBe(huge);
+    expect(r.originalBytes).toBeUndefined();
+  });
+
+  it("treats a negative cap as disabled rather than truncating to nothing", () => {
+    expect(applyAbsoluteDiffCap(patch, -1)).toEqual({ diff: patch, truncated: false });
+  });
+
+  it("leaves a patch at exactly the cap intact", () => {
+    const bytes = Buffer.byteLength(patch, "utf8");
+    expect(applyAbsoluteDiffCap(patch, bytes)).toEqual({
+      diff: patch,
+      truncated: false,
+    });
+  });
+
+  it("reports the pre-cap size and stays within the cap when it fires", () => {
+    const r = applyAbsoluteDiffCap(patch, 40);
+    expect(r.truncated).toBe(true);
+    expect(r.originalBytes).toBe(Buffer.byteLength(patch, "utf8"));
+    expect(Buffer.byteLength(r.diff, "utf8")).toBeLessThanOrEqual(40);
+    expect(r.diff).toContain("[diff truncated");
+  });
+
+  it("never splits a multi-byte code point", () => {
+    // Every character is 3 bytes: a naive byte cut would emit U+FFFD.
+    const jp = `${"日".repeat(200)}\n`;
+    const r = applyAbsoluteDiffCap(jp, 256);
+    expect(r.truncated).toBe(true);
+    expect(r.diff).not.toContain("�");
+    expect(Buffer.byteLength(r.diff, "utf8")).toBeLessThanOrEqual(256);
+  });
+
+  it("cuts on a line boundary so no partial patch line survives", () => {
+    const many = Array.from({ length: 200 }, (_, i) => `+line ${i}`).join("\n") + "\n";
+    const r = applyAbsoluteDiffCap(many, 500);
+    const body = r.diff.slice(0, r.diff.indexOf("\n... [diff truncated"));
+    expect(body.endsWith("\n")).toBe(true);
+  });
+
+  it("emits the marker alone when the cap is smaller than the marker", () => {
+    const r = applyAbsoluteDiffCap(patch, 4);
+    expect(r.truncated).toBe(true);
+    expect(r.diff).toContain("[diff truncated");
+    expect(r.originalBytes).toBe(Buffer.byteLength(patch, "utf8"));
   });
 });

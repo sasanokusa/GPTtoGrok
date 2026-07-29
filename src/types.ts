@@ -256,7 +256,7 @@ export interface GrokToolResult {
   response_mode_requested: ResponseMode;
   /** Mode actually applied — what `auto` picked, or a safety downgrade. */
   response_mode_effective: EffectiveResponseMode;
-  /** True only when `diff` holds the complete redacted patch. */
+  /** True only when the patch body is inlined in `diff`. */
   diff_included: boolean;
   /** UTF-8 byte length of the redacted patch (independent of `diff_included`). */
   diff_bytes: number;
@@ -265,7 +265,20 @@ export interface GrokToolResult {
   diff_stats: DiffStats;
   /** Absolute path to the stored redacted patch, or null. */
   diff_artifact_path: string | null;
-  /** Short follow-up hints when the diff body was not inlined. */
+  /**
+   * True only when the patch (inlined or in the artifact) represents the whole
+   * detected change. False when collection dropped something — secret paths,
+   * binary or oversized untracked files — or when an absolute cap cut the body.
+   *
+   * **Only a `diff_complete: true` patch may be applied directly.** Otherwise
+   * reconcile against `worktree_path` / `effective_cwd`.
+   */
+  diff_complete: boolean;
+  /** True only when an absolute byte cap cut the patch mid-stream. */
+  diff_truncated: boolean;
+  /** UTF-8 byte length before the cap. Present only when `diff_truncated`. */
+  original_diff_bytes?: number;
+  /** Short follow-up hints when the diff was not inlined or is incomplete. */
   next_actions: string[];
   meta: {
     stop_reason?: string;

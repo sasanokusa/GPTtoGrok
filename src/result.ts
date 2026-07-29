@@ -18,6 +18,12 @@ export interface ResponseModeResultFields {
   diffSha256: string;
   diffStats: DiffStats;
   diffArtifactPath: string | null;
+  /** False when anything was dropped from the patch (omission or truncation). */
+  diffComplete: boolean;
+  /** True only when an absolute byte cap cut the patch body. */
+  diffTruncated: boolean;
+  /** Byte length before the cap; present only when `diffTruncated`. */
+  originalDiffBytes?: number;
   nextActions: string[];
 }
 
@@ -54,6 +60,11 @@ export function assembleResult(opts: {
     diff_sha256: opts.response.diffSha256,
     diff_stats: opts.response.diffStats,
     diff_artifact_path: opts.response.diffArtifactPath,
+    diff_complete: opts.response.diffComplete,
+    diff_truncated: opts.response.diffTruncated,
+    ...(opts.response.originalDiffBytes !== undefined
+      ? { original_diff_bytes: opts.response.originalDiffBytes }
+      : {}),
     next_actions: opts.response.nextActions,
     meta: opts.meta,
   };

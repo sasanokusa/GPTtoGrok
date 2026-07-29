@@ -583,6 +583,9 @@ interface GrokToolResult {
   diff_sha256: string;
   diff_stats: { files_changed: number; insertions: number; deletions: number };
   diff_artifact_path: string | null;
+  diff_complete: boolean;          // false ⇒ patch omits part of the change; do not apply
+  diff_truncated: boolean;         // true only when the opt-in absolute cap cut the body
+  original_diff_bytes?: number;    // present only when diff_truncated
   next_actions: string[];
   meta: {
     stop_reason?: string;
@@ -656,14 +659,45 @@ hard constraint 6) for no compatibility gain.
 
 1. Collect the working-tree change set (`assembleDiff`).
 2. Drop secret-path hunks and secret paths from `changed_files`.
-3. Apply content redaction regexes; cap at `GROK_MCP_MAX_DIFF_BYTES`.
-4. Compute `diff_bytes` (UTF-8) and `diff_sha256` over the **redacted** body.
-5. Resolve `response_mode_effective`.
-6. Inline the body **or** write it to an artifact.
+3. Apply content redaction regexes. **No byte cap here.**
+4. Apply the opt-in absolute cap (`GROK_MCP_MAX_DIFF_BYTES`, default `0` = off).
+5. Compute `diff_bytes` (UTF-8) and `diff_sha256` over the resulting body.
+6. Resolve `response_mode_effective`.
+7. Inline the body **or** write it to an artifact.
 
-Steps 4–6 all consume the single string produced by step 3. There is deliberately no
+Steps 5–7 all consume the single string produced by steps 3–4. There is deliberately no
 second diff-collection path, so `compact` cannot bypass redaction; an unredacted diff is
 never written to a temp file.
+
+**Why no cap in step 3 (changed).** The original design capped the patch inside
+`assembleDiff` at a hard-coded 1 MiB default, i.e. *before* the response-mode decision
+existed. That was wrong on both counts:
+
+- It bought no memory saving. `runGit` already accumulates git's entire stdout into one
+  in-memory string, so the peak is paid during collection; truncating afterwards only
+  discards bytes already allocated. Real memory protection comes from
+  `GROK_MCP_MAX_UNTRACKED_FILE_BYTES`, which is checked against `stat()` size *before*
+  the file is read.
+- It corrupted the artifact. A `compact` artifact could only ever hold the truncated
+  patch, so the one mode designed to preserve a large diff in full silently lost it.
+
+Size is now handled by mode selection, which never alters the patch: an oversized diff is
+moved to an artifact whole. Truncation survives only as an opt-in cap in step 4, and when
+it fires the result says so (`diff_truncated`, `original_diff_bytes`, `diff_complete:
+false`, warning `DIFF_TRUNCATED`) so a cut patch is never presented as applyable.
+
+#### `diff_complete` (normative)
+
+`assembleDiff` returns `complete: false` whenever a detected change is dropped from the
+patch: secret paths / hunks, an untracked file over `GROK_MCP_MAX_UNTRACKED_FILE_BYTES`, a
+binary or unreadable untracked file, or a path that escaped the repo root. The response
+stage ANDs that with "not truncated" to produce `diff_complete`, and raises
+`DIFF_INCOMPLETE` plus a leading `Do not apply the patch as-is` entry in `next_actions`.
+
+`diff_complete` describes the **patch**, not the transport: it is independent of
+`diff_included`, so a `compact` artifact is labelled just as honestly as an inlined body.
+An empty tree (or a non-git directory) is vacuously complete — nothing was detected, so
+nothing was omitted.
 
 `diff_stats` is parsed from that same redacted patch (counting `diff --git` headers and
 `+`/`-` body lines) rather than scraped from `git diff --stat` text, so the numbers always
@@ -676,6 +710,7 @@ describe exactly what was returned or stored. It can therefore report fewer file
 |---------|--------|---------|
 | `full` (or auto→full) with `diff_bytes > GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` | → `compact`, patch stored whole (**not** truncated) | `DIFF_HARD_LIMIT_APPLIED` |
 | artifact write fails | → `summary_only`; `summary` / `changed_files` / `worktree_path` / `diff_stats` / `diff_sha256` retained | `DIFF_ARTIFACT_WRITE_FAILED` |
+| opt-in `GROK_MCP_MAX_DIFF_BYTES` exceeded (off by default) | body cut on a UTF-8 + line boundary; `diff_complete: false`, `original_diff_bytes` set | `DIFF_TRUNCATED`, `DIFF_INCOMPLETE` |
 
 Other warnings: `DIFF_NOT_INLINED` (non-empty patch omitted), `DIFF_ARTIFACT_CREATED`, and
 `DIFF_DISCARDED_NO_ARTIFACT` — emitted when a non-empty patch is neither inlined nor stored
@@ -751,7 +786,7 @@ Run in `effective_cwd` (worktree or original). Output must be **`git apply`-frie
        ```
        for new files (`relpath` POSIX separators, no leading `./`).
      - Never leave absolute host paths in the returned `diff` string.
-5. Concatenate tracked + normalized untracked patches; content redaction regex; cap at `GROK_MCP_MAX_DIFF_BYTES` (default 1 MiB) with trailing `\n... [diff truncated]`.
+5. Concatenate tracked + normalized untracked patches; content redaction regex. **No byte cap** — `assembleDiff` returns the whole redacted patch plus `complete: boolean`. Return-volume control is the response-mode stage's job (see "Response modes"); the only remaining truncation is the opt-in `GROK_MCP_MAX_DIFF_BYTES` cap applied there, which reports itself via `diff_truncated` / `original_diff_bytes`.
 6. **Do not** mutate the index (`git add -N` forbidden in v1).
 7. **Unit test (required)**: create temp repo + untracked file → assemble `diff` → `git apply` into a second clean worktree/clone of the same commit → file content matches.
 
@@ -1514,8 +1549,9 @@ GROK_MCP_ALLOWED_ROOTS = "/Users/YOU/Documents:/Users/YOU/src"
 - result: diff algorithm with untracked file fixture; caps
 - session-store: atomic write, corrupt recovery, lock contention
 - response-mode: auto threshold boundaries; explicit modes; hard-cap downgrade; `diff_stats` parsing; `diff_sha256` / `diff_bytes` (multi-byte safe); `next_actions`
+- absolute cap: `0` / negative = disabled; exact-cap boundary; never splits a multi-byte code point; cuts on a line boundary; cap smaller than the marker; `original_diff_bytes` reported
 - diff-artifact: path stays under the cache root; non-UUID id rejected; symlinked scope dir rejected; planted symlink target untouched; `0600`; concurrent writes never collide; GC removes only managed artifacts and never symlinks / outside-root files
-- config: `GROK_MCP_INLINE_DIFF_MAX_BYTES` valid, `0`, negative, `NaN`, fractional, non-numeric, over-ceiling
+- config: `GROK_MCP_INLINE_DIFF_MAX_BYTES` valid, `0`, negative, `NaN`, fractional, non-numeric, over-ceiling; `GROK_MCP_MAX_DIFF_BYTES` defaults to `0` (unlimited)
 - schema: `response_mode` defaults to `auto` when omitted; invalid value → `GROK_MCP_INVALID_ARGS` envelope
 
 ### Integration (mock-grok)
@@ -1528,6 +1564,7 @@ GROK_MCP_ALLOWED_ROOTS = "/Users/YOU/Documents:/Users/YOU/src"
 - artifact write failure → `summary_only` degradation with `summary` / `changed_files` / `worktree_path` retained
 - continue: per-call `response_mode` override, default `auto` (not inherited), distinct artifact per call
 - read_only: pre-existing WIP still suppressed, `test_command` still rejected, `UNEXPECTED_MUTATION` still reported
+- diff completeness: a >1 MiB patch is neither truncated nor cut in the artifact; secret-path omission and an oversized untracked file both yield `diff_complete: false`; the opt-in cap sets `diff_truncated` + `original_diff_bytes` and the stored bytes still match `diff_sha256`
 
 ### Contract
 

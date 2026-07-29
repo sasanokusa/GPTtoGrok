@@ -20,6 +20,12 @@ export interface ServerConfig {
   secretBasenames: string[];
   secretGlobsAggressive: boolean;
   maxTimeoutMs: number;
+  /**
+   * Opt-in absolute cap on the redacted patch body, applied in the response-mode
+   * stage. `0` (the default) means unlimited: oversized diffs are moved to an
+   * artifact rather than cut. A non-zero value truncates and is reported via
+   * `diff_truncated` / `original_diff_bytes`.
+   */
   maxDiffBytes: number;
   maxSummaryBytes: number;
   maxPromptDiffBytes: number;
@@ -63,6 +69,9 @@ function parseIntEnv(v: string | undefined, fallback: number): number {
 export const DEFAULT_INLINE_DIFF_MAX_BYTES = 65_536;
 export const DEFAULT_INLINE_DIFF_HARD_MAX_BYTES = 1_048_576;
 export const INLINE_DIFF_BYTES_CEILING = 16 * 1024 * 1024;
+/** `0` = unlimited. Truncation is opt-in; oversize alone moves a diff to an artifact. */
+export const DEFAULT_MAX_DIFF_BYTES = 0;
+export const MAX_DIFF_BYTES_CEILING = 512 * 1024 * 1024;
 
 /**
  * Byte-limit env parsing with fail-safe validation.
@@ -215,7 +224,17 @@ export function loadConfig(): ServerConfig {
       fileCfg.secretGlobsAggressive ?? false,
     ),
     maxTimeoutMs: parseIntEnv(process.env.GROK_MCP_MAX_TIMEOUT_MS, 3_600_000),
-    maxDiffBytes: parseIntEnv(process.env.GROK_MCP_MAX_DIFF_BYTES, 1_048_576),
+    maxDiffBytes: parseByteLimitEnv(
+      "GROK_MCP_MAX_DIFF_BYTES",
+      process.env.GROK_MCP_MAX_DIFF_BYTES,
+      sanitizeByteLimit(
+        "maxDiffBytes",
+        fileCfg.maxDiffBytes,
+        DEFAULT_MAX_DIFF_BYTES,
+        MAX_DIFF_BYTES_CEILING,
+      ),
+      MAX_DIFF_BYTES_CEILING,
+    ),
     maxSummaryBytes: parseIntEnv(process.env.GROK_MCP_MAX_SUMMARY_BYTES, 512_000),
     maxPromptDiffBytes: parseIntEnv(
       process.env.GROK_MCP_MAX_PROMPT_DIFF_BYTES,

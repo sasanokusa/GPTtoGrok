@@ -3,9 +3,13 @@
  *
  * Invariant: every function here consumes the **already redacted** diff string
  * produced by {@link import("./git.js").assembleDiff} (secret-path hunks removed,
- * content regexes applied, capped at `maxDiffBytes`). There is deliberately no
- * second diff-collection path — an artifact can only ever hold the same bytes
- * that `response_mode: "full"` would have inlined.
+ * content regexes applied, no byte cap). There is deliberately no second
+ * diff-collection path — an artifact can only ever hold the same bytes that
+ * `response_mode: "full"` would have inlined.
+ *
+ * Sizing order is fixed: collect → redact → optional absolute cap
+ * ({@link applyAbsoluteDiffCap}) → mode decision → inline or artifact. The cap
+ * is the only step that may alter the patch, and it always reports itself.
  */
 
 import crypto from "node:crypto";
@@ -98,6 +102,64 @@ export function computeDiffStats(diff: string): DiffStats {
   return { files_changed: files, insertions, deletions };
 }
 
+/** Appended to a capped patch so a human reading the body sees the cut. */
+const TRUNCATION_MARKER = "\n... [diff truncated: incomplete patch]\n";
+
+export interface AbsoluteDiffCap {
+  /** Patch body after the cap. Identical string when nothing was cut. */
+  diff: string;
+  truncated: boolean;
+  /** UTF-8 byte length before the cap; only set when `truncated`. */
+  originalBytes?: number;
+}
+
+/**
+ * Apply an opt-in absolute byte cap to an already-redacted patch.
+ *
+ * `maxBytes <= 0` disables the cap entirely (the default) — the patch is
+ * returned untouched no matter how large it is. Size is then handled purely by
+ * `response_mode`, which moves big patches to an artifact rather than cutting
+ * them.
+ *
+ * When the cap does fire the patch is cut on a UTF-8 code-point boundary,
+ * preferring the last newline so no partial line survives, and a marker is
+ * appended. The result is **not** an applyable patch; callers must surface
+ * `diff_truncated: true` / `diff_complete: false`.
+ */
+export function applyAbsoluteDiffCap(
+  diff: string,
+  maxBytes: number,
+): AbsoluteDiffCap {
+  if (maxBytes <= 0) return { diff, truncated: false };
+  const buf = Buffer.from(diff, "utf8");
+  if (buf.length <= maxBytes) return { diff, truncated: false };
+
+  const markerBytes = Buffer.byteLength(TRUNCATION_MARKER, "utf8");
+  // Degenerate cap smaller than the marker: emit the marker alone rather than
+  // a body that silently exceeds the limit.
+  if (maxBytes <= markerBytes) {
+    return {
+      diff: TRUNCATION_MARKER,
+      truncated: true,
+      originalBytes: buf.length,
+    };
+  }
+
+  let end = maxBytes - markerBytes;
+  // Back off past UTF-8 continuation bytes (0b10xxxxxx) so we never split a
+  // code point — `buf.toString` would otherwise substitute U+FFFD.
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+  // Prefer a line boundary; keep the byte cut if the tail has no newline.
+  const lastNl = buf.lastIndexOf(0x0a, end - 1);
+  if (lastNl > 0) end = lastNl + 1;
+
+  return {
+    diff: buf.toString("utf8", 0, end) + TRUNCATION_MARKER,
+    truncated: true,
+    originalBytes: buf.length,
+  };
+}
+
 export interface ResponseModeDecision {
   effective: EffectiveResponseMode;
   /** True when an explicit/auto `full` was downgraded by the hard inline cap. */
@@ -137,24 +199,33 @@ export function resolveEffectiveResponseMode(opts: {
   return { effective: "full", hardLimitApplied: false };
 }
 
-/** Short, structured follow-up hints for the parent agent (empty for `full`). */
+/** Short, structured follow-up hints for the parent agent. */
 export function buildNextActions(
   effective: EffectiveResponseMode,
-  opts: { hasWorktree: boolean; diffRecoverable: boolean },
+  opts: { hasWorktree: boolean; diffRecoverable: boolean; diffComplete: boolean },
 ): string[] {
-  if (effective === "full") return [];
+  // An incomplete patch must never be applied blind, whichever mode returned it.
+  const incomplete = opts.diffComplete
+    ? []
+    : [
+        `Do not apply the patch as-is: diff_complete is false; reconcile against ${
+          opts.hasWorktree ? "worktree_path" : "effective_cwd"
+        }`,
+      ];
+  if (effective === "full") return incomplete;
   if (!opts.diffRecoverable) {
     // Nothing survives this call: no body, no artifact, no retained worktree.
     return [
+      ...incomplete,
       "Re-run with response_mode \"full\" or \"compact\" to obtain the patch",
       "Keep keep_worktree=true to inspect changes in the worktree",
     ];
   }
   const where = opts.hasWorktree ? "worktree_path" : "effective_cwd";
-  const actions = [`Inspect changed_files under ${where}`];
+  const actions = [...incomplete, `Inspect changed_files under ${where}`];
   actions.push(
     effective === "compact"
-      ? "Read diff_artifact_path for the full redacted patch"
+      ? `Read diff_artifact_path for the ${opts.diffComplete ? "full" : "partial"} redacted patch`
       : 'Re-run with response_mode "compact" or "full" to obtain the patch',
   );
   actions.push("Run independent tests before applying changes");

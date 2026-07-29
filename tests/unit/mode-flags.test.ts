@@ -28,7 +28,7 @@ function minimalConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     secretBasenames: [".env"],
     secretGlobsAggressive: false,
     maxTimeoutMs: 3_600_000,
-    maxDiffBytes: 1_048_576,
+    maxDiffBytes: 0,
     maxSummaryBytes: 512_000,
     maxPromptDiffBytes: 262_144,
     maxUntrackedFileBytes: 524_288,

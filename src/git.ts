@@ -387,28 +387,61 @@ export interface DiffAssembly {
   changedFiles: string[];
   diff: string;
   warnings: string[];
+  /**
+   * True when `diff` contains every change git reported for this tree.
+   *
+   * False when something was deliberately dropped during collection — secret
+   * paths / hunks, an untracked file over `maxUntrackedFileBytes`, a binary or
+   * unreadable untracked file, a path that escaped the repo root. Such a patch
+   * must not be advertised as a complete, applyable representation of the change.
+   *
+   * An empty tree (or a non-git directory) is vacuously complete: nothing was
+   * detected, so nothing was omitted.
+   */
+  complete: boolean;
 }
 
+/**
+ * Collect the working-tree change as a single redacted patch.
+ *
+ * Pipeline (single path, no second diff source):
+ *   git status/diff → secret-path & secret-hunk removal → content redaction.
+ *
+ * There is deliberately **no byte cap here**. `runGit` already buffers git's
+ * entire stdout, so truncating afterwards costs the same peak memory while
+ * silently corrupting the patch. Return-volume control belongs downstream in
+ * `response_mode` (inline vs. artifact), which never mutates the patch body;
+ * an opt-in absolute cap lives there and is reported via `diff_truncated`.
+ */
 export async function assembleDiff(
   effectiveCwd: string,
   redactCfg: RedactConfig,
   opts: {
-    maxDiffBytes: number;
     maxUntrackedFileBytes: number;
   },
 ): Promise<DiffAssembly> {
   const warnings: string[] = [];
+  /** Set whenever a detected change is dropped from `diff`. */
+  let omitted = false;
   let gitRoot: string;
   try {
     gitRoot = await getRepoRoot(effectiveCwd);
   } catch {
-    return { changedFiles: [], diff: "", warnings: ["NOT_A_GIT_REPO_FOR_DIFF"] };
+    return {
+      changedFiles: [],
+      diff: "",
+      warnings: ["NOT_A_GIT_REPO_FOR_DIFF"],
+      complete: true,
+    };
   }
 
   const porcelain = await gitStatusPorcelain(gitRoot);
   const parsed = parsePorcelainPaths(porcelain);
   const { kept, redacted } = filterSecretPaths(parsed.all, redactCfg);
-  if (redacted.length) warnings.push("REDACTED_SECRET_PATHS");
+  if (redacted.length) {
+    warnings.push("REDACTED_SECRET_PATHS");
+    omitted = true;
+  }
 
   // Tracked diff — then strip secret-path hunks (tracked .env etc. must not leak)
   const tracked = await runGit(["diff", "HEAD", "--"], gitRoot);
@@ -416,7 +449,10 @@ export async function assembleDiff(
   let diffParts: string[] = [];
   if (tracked.stdout.trim()) {
     const filtered = filterSecretDiffHunks(tracked.stdout, redactCfg);
-    if (filtered.redactedAny) warnings.push("REDACTED_SECRET_PATHS");
+    if (filtered.redactedAny) {
+      warnings.push("REDACTED_SECRET_PATHS");
+      omitted = true;
+    }
     if (filtered.diff.trim()) {
       diffParts.push(filtered.diff.replace(/\n?$/, "\n"));
     }
@@ -426,22 +462,31 @@ export async function assembleDiff(
   for (const rel of untrackedKept) {
     if (rel.includes("..") || path.isAbsolute(rel)) {
       warnings.push("PATH_ESCAPE_SKIPPED");
+      omitted = true;
       continue;
     }
     const abs = path.join(gitRoot, rel);
     try {
       const st = await fs.stat(abs);
       if (!st.isFile()) continue;
+      // Pre-read cap: checked against stat() size, so an oversized file is never
+      // loaded into memory. This is real memory protection, unlike a post-hoc
+      // cap on the assembled patch.
       if (st.size > opts.maxUntrackedFileBytes) {
         warnings.push("UNTRACKED_TOO_LARGE");
+        omitted = true;
         continue;
       }
       const buf = await fs.readFile(abs);
       if (isBinaryBuffer(buf)) {
         warnings.push("BINARY_SKIPPED");
+        omitted = true;
         continue;
       }
-      if (isSecretPath(rel, redactCfg)) continue;
+      if (isSecretPath(rel, redactCfg)) {
+        omitted = true;
+        continue;
+      }
 
       const patch = await runGit(
         ["diff", "--no-index", "--", "/dev/null", rel],
@@ -453,27 +498,19 @@ export async function assembleDiff(
       }
     } catch {
       warnings.push("UNTRACKED_DIFF_FAILED");
+      omitted = true;
     }
   }
 
-  let diff = redactText(diffParts.join(""));
-  if (Buffer.byteLength(diff, "utf8") > opts.maxDiffBytes) {
-    // truncate
-    let truncated = diff;
-    while (
-      Buffer.byteLength(truncated, "utf8") > opts.maxDiffBytes - 40 &&
-      truncated.length > 0
-    ) {
-      truncated = truncated.slice(0, Math.floor(truncated.length * 0.9));
-    }
-    diff = `${truncated}\n... [diff truncated]`;
-    warnings.push("DIFF_TRUNCATED");
-  }
+  // Content redaction is the last transform; the result is the canonical patch
+  // that response_mode either inlines verbatim or writes to an artifact.
+  const diff = redactText(diffParts.join(""));
 
   return {
     changedFiles: kept,
     diff,
     warnings: [...new Set(warnings)],
+    complete: !omitted,
   };
 }
 

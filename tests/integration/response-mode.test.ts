@@ -88,7 +88,7 @@ function makeConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     secretBasenames: [],
     secretGlobsAggressive: false,
     maxTimeoutMs: 3_600_000,
-    maxDiffBytes: 1_048_576,
+    maxDiffBytes: 0,
     maxSummaryBytes: 512_000,
     maxPromptDiffBytes: 262_144,
     maxUntrackedFileBytes: 524_288,
@@ -654,5 +654,110 @@ describe("read_only safety is unchanged by response_mode", () => {
     expect(r.diff_artifact_path).toBeTruthy();
     expect(fs.readFileSync(r.diff_artifact_path!, "utf8")).toContain("out.txt");
     expect(r.next_actions[0]).toContain("effective_cwd");
+  });
+});
+
+describe("diff completeness and the absolute cap", () => {
+  it("does not truncate a diff past the old 1 MiB limit; the artifact holds it whole", async () => {
+    const repo = initRepo();
+    // Raise the pre-read untracked cap so this exercises patch size, not file size.
+    const ctx = makeCtx(makeConfig({ maxUntrackedFileBytes: 8 * 1024 * 1024 }));
+    // ~14k lines x ~85 bytes ≈ 1.2 MiB — over the former hard-coded assembleDiff cap.
+    const r = await implement({
+      ctx,
+      repo,
+      grokBin: mockWritingLines(14_000),
+      responseMode: "compact",
+    });
+
+    expect(r.diff_bytes).toBeGreaterThan(1_048_576);
+    expect(r.diff_truncated).toBe(false);
+    expect(r.diff_complete).toBe(true);
+    expect(r.original_diff_bytes).toBeUndefined();
+    expect(r.warnings).not.toContain("DIFF_TRUNCATED");
+
+    const stored = fs.readFileSync(r.diff_artifact_path!, "utf8");
+    expect(Buffer.byteLength(stored, "utf8")).toBe(r.diff_bytes);
+    expect(crypto.createHash("sha256").update(stored, "utf8").digest("hex")).toBe(
+      r.diff_sha256,
+    );
+    // Whole patch: the last generated line survived the pipeline.
+    expect(stored).toContain("generated content line 13999");
+  });
+
+  it("marks a diff incomplete when secret paths were dropped during collection", async () => {
+    const repo = initRepo();
+    const ctx = makeCtx(makeConfig({ secretBasenames: [".env"] }));
+    const r = await implement({
+      ctx,
+      repo,
+      grokBin: writeMockGrok(
+        `echo "API_TOKEN=placeholder-not-real" > .env
+echo "export const n = 1;" > app.ts`,
+      ),
+      responseMode: "full",
+    });
+
+    expect(r.warnings).toContain("REDACTED_SECRET_PATHS");
+    expect(r.diff_complete).toBe(false);
+    expect(r.warnings).toContain("DIFF_INCOMPLETE");
+    // Not a truncation — nothing was cut, something was withheld.
+    expect(r.diff_truncated).toBe(false);
+    expect(r.diff).toContain("app.ts");
+    expect(r.diff).not.toContain(".env");
+    expect(r.next_actions.join(" ")).toContain("Do not apply");
+  });
+
+  it("opt-in cap truncates, reports the original size, and refuses to claim completeness", async () => {
+    const repo = initRepo();
+    const ctx = makeCtx(makeConfig({ maxDiffBytes: 4096 }));
+    const r = await implement({
+      ctx,
+      repo,
+      grokBin: mockWritingLines(600),
+      responseMode: "compact",
+    });
+
+    expect(r.diff_truncated).toBe(true);
+    expect(r.diff_complete).toBe(false);
+    expect(r.original_diff_bytes).toBeGreaterThan(4096);
+    expect(r.diff_bytes).toBeLessThanOrEqual(4096);
+    expect(r.warnings).toContain("DIFF_TRUNCATED");
+
+    // bytes / hash describe the truncated body that was actually stored.
+    const stored = fs.readFileSync(r.diff_artifact_path!, "utf8");
+    expect(Buffer.byteLength(stored, "utf8")).toBe(r.diff_bytes);
+    expect(crypto.createHash("sha256").update(stored, "utf8").digest("hex")).toBe(
+      r.diff_sha256,
+    );
+    expect(stored).toContain("[diff truncated");
+    expect(r.next_actions.join(" ")).toContain("Do not apply");
+  });
+
+  it("reports a clean small diff as complete and untruncated", async () => {
+    const repo = initRepo();
+    const ctx = makeCtx(makeConfig());
+    const r = await implement({ ctx, repo, grokBin: mockWritingLines(3) });
+
+    expect(r.response_mode_effective).toBe("full");
+    expect(r.diff_complete).toBe(true);
+    expect(r.diff_truncated).toBe(false);
+    expect(r.original_diff_bytes).toBeUndefined();
+    expect(r.warnings).not.toContain("DIFF_INCOMPLETE");
+    expect(r.next_actions).toEqual([]);
+  });
+});
+
+describe("the pre-read untracked cap is reported, not silently swallowed", () => {
+  it("flags diff_complete=false when an oversized untracked file is skipped", async () => {
+    const repo = initRepo();
+    const ctx = makeCtx(makeConfig({ maxUntrackedFileBytes: 4096 }));
+    const r = await implement({ ctx, repo, grokBin: mockWritingLines(600) });
+
+    expect(r.warnings).toContain("UNTRACKED_TOO_LARGE");
+    expect(r.diff_complete).toBe(false);
+    expect(r.diff_truncated).toBe(false);
+    expect(r.changed_files).toContain("out.txt");
+    expect(r.next_actions.join(" ")).toContain("Do not apply");
   });
 });

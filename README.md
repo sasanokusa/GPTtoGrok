@@ -82,14 +82,34 @@ Present on **every** result, in all modes:
 | `diff_sha256` | SHA-256 of the redacted patch that was returned and/or stored |
 | `diff_stats` | `{ files_changed, insertions, deletions }` — parsed from the redacted patch, not from `git diff --stat` text |
 | `diff_artifact_path` | absolute path to the stored patch, or `null` |
-| `next_actions` | 3 short hints when the diff was not inlined; `[]` for `full` |
+| `diff_complete` | `true` only when the patch represents the **whole** detected change. **Only a complete patch may be applied directly** |
+| `diff_truncated` | `true` only when an opt-in absolute byte cap cut the patch body |
+| `original_diff_bytes` | byte length before the cap; present only when `diff_truncated` |
+| `next_actions` | short hints when the diff was not inlined or is incomplete; `[]` for a complete `full` |
 
 With no changes the shape stays consistent: `diff_bytes: 0`, `diff_sha256` = the
-empty-string digest, `diff_stats` all zeroes, `diff_artifact_path: null`.
+empty-string digest, `diff_stats` all zeroes, `diff_artifact_path: null`,
+`diff_complete: true`, `diff_truncated: false`.
 
 `diff_stats.files_changed` counts `diff --git` headers in the patch, so it can be
 lower than `changed_files.length` when binary or oversized untracked files were
 listed but not patched.
+
+#### `diff_complete` — when the patch is *not* the whole story
+
+Size alone never makes a patch incomplete: an oversized diff moves to an artifact
+intact, it is not cut. `diff_complete: false` means something was genuinely left
+out, and the patch will not reproduce the change on its own:
+
+| Cause | Warning |
+|-------|---------|
+| secret paths / hunks removed before the patch was assembled | `REDACTED_SECRET_PATHS` |
+| untracked file above `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` (never read into memory) | `UNTRACKED_TOO_LARGE` |
+| binary or unreadable untracked file | `BINARY_SKIPPED` / `UNTRACKED_DIFF_FAILED` |
+| an opt-in absolute cap cut the body | `DIFF_TRUNCATED` (with `diff_truncated: true`) |
+
+Any of these also raise `DIFF_INCOMPLETE` and put a `Do not apply the patch as-is`
+hint first in `next_actions`. Reconcile against `worktree_path` instead.
 
 ### Warnings
 
@@ -97,6 +117,8 @@ listed but not patched.
 |---------|---------|
 | `DIFF_NOT_INLINED` | a non-empty patch was omitted from the response |
 | `DIFF_ARTIFACT_CREATED` | the patch was written to `diff_artifact_path` |
+| `DIFF_INCOMPLETE` | `diff_complete` is `false` — the patch omits part of the change; do not apply it as-is |
+| `DIFF_TRUNCATED` | an opt-in `GROK_MCP_MAX_DIFF_BYTES` cap cut the body. Off by default |
 | `DIFF_HARD_LIMIT_APPLIED` | `full` exceeded `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` and was degraded to `compact` — the patch is **not** truncated, it is stored whole |
 | `DIFF_ARTIFACT_WRITE_FAILED` | the artifact could not be written; the call degrades to `summary_only` rather than inlining a huge patch. `summary`, `changed_files`, `worktree_path`, `diff_stats` and `diff_sha256` are still returned |
 | `DIFF_DISCARDED_NO_ARTIFACT` | no diff body, no artifact **and** `keep_worktree: false` — the patch is unrecoverable after this call. `next_actions` tells you how to re-run |
@@ -149,6 +171,8 @@ Returns:
   "diff_sha256": "9f2b…",
   "diff_stats": { "files_changed": 34, "insertions": 512, "deletions": 388 },
   "diff_artifact_path": "/Users/you/.cache/codex-grok-mcp/diffs/<scope>/<uuid>.diff",
+  "diff_complete": true,
+  "diff_truncated": false,
   "next_actions": [
     "Inspect changed_files under worktree_path",
     "Read diff_artifact_path for the full redacted patch",
@@ -198,7 +222,10 @@ sed -n '1,200p' "$DIFF_ARTIFACT_PATH"
 shasum -a 256 "$DIFF_ARTIFACT_PATH"
 ```
 
-5. Apply as usual: `git -C <original> apply "$DIFF_ARTIFACT_PATH"`.
+5. Check `diff_complete` first. If it is `true`, apply as usual:
+   `git -C <original> apply "$DIFF_ARTIFACT_PATH"`. If it is `false` the patch is
+   partial by design — copy the files you want out of `worktree_path` instead of
+   applying it.
 6. Continue the session at a different verbosity — `response_mode` is per call:
 
 ```json
@@ -377,8 +404,17 @@ A generated `package.json`, test file, or script in the worktree is therefore ex
 | `GROK_MCP_WORKTREE_TTL_HOURS` | `72` | TTL for worktree **and** diff-artifact GC (start-up only) |
 | `GROK_MCP_INLINE_DIFF_MAX_BYTES` | `65536` | `response_mode: "auto"` inlines the diff while it is ≤ this many bytes; above it falls back to `compact`. `0` = never inline |
 | `GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES` | `1048576` | Absolute inline ceiling. A larger diff degrades to `compact` even for `response_mode: "full"` (warning `DIFF_HARD_LIMIT_APPLIED`) |
+| `GROK_MCP_MAX_DIFF_BYTES` | `0` *(unlimited)* | Opt-in absolute cap on the patch body itself. `0` disables truncation entirely — oversized diffs go to an artifact whole. A non-zero value cuts the patch and sets `diff_truncated: true` / `diff_complete: false` / `original_diff_bytes`. Max 512 MiB |
 
-Both byte limits accept non-negative integers up to 16 MiB. Anything else —
+> **Changed in this release.** `GROK_MCP_MAX_DIFF_BYTES` used to default to 1 MiB
+> and truncate during diff collection — *before* `response_mode` ran, so even
+> `compact` artifacts held a silently cut patch. It is now off by default and, if
+> you set it, applies in the response-mode stage and is reported honestly. Since
+> `git`'s output is fully buffered in memory either way, the old cap bought no
+> peak-memory saving; use `GROK_MCP_MAX_UNTRACKED_FILE_BYTES` (a pre-read cap) for
+> that.
+
+The inline byte limits accept non-negative integers up to 16 MiB. Anything else —
 negative, `NaN`, fractional, non-numeric, or over the ceiling — is **ignored**: the
 default is used and a warning is written to **stderr** at startup.
 

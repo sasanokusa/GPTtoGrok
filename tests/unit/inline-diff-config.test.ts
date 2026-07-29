@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_INLINE_DIFF_HARD_MAX_BYTES,
   DEFAULT_INLINE_DIFF_MAX_BYTES,
+  DEFAULT_MAX_DIFF_BYTES,
   INLINE_DIFF_BYTES_CEILING,
+  MAX_DIFF_BYTES_CEILING,
   loadConfig,
   parseByteLimitEnv,
   sanitizeByteLimit,
@@ -11,6 +13,7 @@ import {
 const ENV_KEYS = [
   "GROK_MCP_INLINE_DIFF_MAX_BYTES",
   "GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES",
+  "GROK_MCP_MAX_DIFF_BYTES",
 ];
 const saved = new Map<string, string | undefined>();
 
@@ -101,5 +104,30 @@ describe("loadConfig inline diff limits", () => {
 
   it("keeps ENV_KEYS restored between cases", () => {
     expect(ENV_KEYS.every((k) => typeof k === "string")).toBe(true);
+  });
+});
+
+describe("GROK_MCP_MAX_DIFF_BYTES (opt-in absolute cap)", () => {
+  it("defaults to 0 = unlimited, so diffs are never truncated before response_mode", () => {
+    expect(DEFAULT_MAX_DIFF_BYTES).toBe(0);
+    setEnv("GROK_MCP_MAX_DIFF_BYTES", undefined);
+    expect(loadConfig().maxDiffBytes).toBe(0);
+  });
+
+  it("accepts an explicit opt-in value", () => {
+    setEnv("GROK_MCP_MAX_DIFF_BYTES", "4096");
+    expect(loadConfig().maxDiffBytes).toBe(4096);
+  });
+
+  it("falls back to unlimited on invalid or out-of-range values", () => {
+    for (const bad of ["-1", "abc", "1.5", "", String(MAX_DIFF_BYTES_CEILING + 1)]) {
+      setEnv("GROK_MCP_MAX_DIFF_BYTES", bad);
+      expect(loadConfig().maxDiffBytes).toBe(DEFAULT_MAX_DIFF_BYTES);
+    }
+  });
+
+  it("allows a cap far above the inline ceiling (artifacts are on disk, not in context)", () => {
+    setEnv("GROK_MCP_MAX_DIFF_BYTES", String(INLINE_DIFF_BYTES_CEILING * 4));
+    expect(loadConfig().maxDiffBytes).toBe(INLINE_DIFF_BYTES_CEILING * 4);
   });
 });

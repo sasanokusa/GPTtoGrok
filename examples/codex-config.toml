@@ -47,6 +47,10 @@ GROK_MCP_LOG_LEVEL = "info"
 # Absolute inline ceiling; an explicit response_mode="full" larger than this
 # degrades to compact (warning DIFF_HARD_LIMIT_APPLIED) instead of truncating.
 # GROK_MCP_INLINE_DIFF_HARD_MAX_BYTES = "1048576"
+# Opt-in cap on the patch body. Default 0 = unlimited; oversized diffs go to an
+# artifact whole rather than being cut. A non-zero value truncates and reports
+# diff_truncated / original_diff_bytes / diff_complete=false.
+# GROK_MCP_MAX_DIFF_BYTES = "0"
 
 # If Codex scrubs the parent environment when spawning MCP servers, explicitly
 # forward vars Grok needs (names depend on host policy):
