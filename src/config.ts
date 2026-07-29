@@ -167,7 +167,7 @@ export const DEFAULT_TIMEOUTS_MS = {
   grok_implement: 1_800_000,
   grok_debug: 1_800_000,
   grok_continue: 1_200_000,
-
+  test_command: 300_000,
 } as const;
 
 export const SECRET_READ_DENY_RULES = [

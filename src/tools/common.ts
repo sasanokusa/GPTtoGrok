@@ -23,12 +23,15 @@ import { resolveWorkingDirectory } from "../path-guard.js";
 import { redactText } from "../redact.js";
 import { assembleResult, emptyTests } from "../result.js";
 import type { SessionStore } from "../session-store.js";
+import { narrowReadOnlyTools, unionDisallowedTools } from "../tool-ids.js";
 import type {
   ExecutionMode,
   GrokToolResult,
+  ReasoningEffort,
   TestsResult,
   ToolName,
 } from "../types.js";
+import { rejectTestCommandInReadOnly } from "../types.js";
 import {
   createManagedWorktree,
   pathExists,
@@ -49,6 +52,7 @@ export interface RunToolParams {
   timeoutMs?: number;
   model?: string;
   maxTurns?: number;
+  reasoningEffort?: ReasoningEffort;
   testCommand?: string;
   testTimeoutMs?: number;
   failOnTestFailure?: boolean;
@@ -72,6 +76,17 @@ export interface RunToolParams {
   restoreCode?: boolean;
   signal?: AbortSignal;
 }
+
+/** Permission modes that would undermine read_only isolation. */
+const UNSAFE_READ_ONLY_PERMISSION_MODES = new Set([
+  "bypassPermissions",
+  "acceptEdits",
+  "auto",
+  "default",
+]);
+
+/** Sandbox values that permit mutation / escape in read_only. */
+const UNSAFE_READ_ONLY_SANDBOXES = new Set(["off", "workspace"]);
 
 function clampTimeout(ms: number, max: number): number {
   return Math.min(Math.max(1, ms), max);
@@ -146,14 +161,33 @@ export function buildModeFlags(
   }
 
   if (mode === "read_only") {
+    if (
+      opts.permissionMode &&
+      UNSAFE_READ_ONLY_PERMISSION_MODES.has(opts.permissionMode)
+    ) {
+      throw new GrokMcpError(
+        "GROK_MCP_INVALID_ARGS",
+        `permission_mode=${opts.permissionMode} is not allowed in read_only mode (forced dontAsk)`,
+      );
+    }
+    if (opts.sandbox && UNSAFE_READ_ONLY_SANDBOXES.has(opts.sandbox)) {
+      throw new GrokMcpError(
+        "GROK_MCP_INVALID_ARGS",
+        `sandbox=${opts.sandbox} is not allowed in read_only mode`,
+      );
+    }
+
     return {
-      tools: opts.tools ?? cfg.defaultReadOnlyTools,
-      disallowedTools: opts.disallowedTools ?? cfg.defaultDisallowedTools,
-      noSubagents: !opts.allowSubagents,
+      tools: narrowReadOnlyTools(cfg.defaultReadOnlyTools, opts.tools),
+      disallowedTools: unionDisallowedTools(
+        cfg.defaultDisallowedTools,
+        opts.disallowedTools,
+      ),
+      noSubagents: true,
       disableWebSearch: !opts.allowWeb,
-      permissionMode: opts.permissionMode ?? "dontAsk",
+      permissionMode: "dontAsk",
       alwaysApprove: false,
-      sandbox: opts.sandbox ?? cfg.sandboxReadOnly ?? undefined,
+      sandbox: opts.sandbox ?? cfg.sandboxReadOnly ?? "read-only",
       deny,
     };
   }
@@ -235,6 +269,8 @@ export async function runTool(
   const started = Date.now();
 
   try {
+    rejectTestCommandInReadOnly(params.mode, params.testCommand);
+
     const resolved = await resolveWorkingDirectory(
       params.workingDirectory,
       config.allowedRoots,
@@ -344,6 +380,7 @@ export async function runTool(
       worktreeRef: params.worktreeRef,
       maxTurns: params.maxTurns,
       model: params.model,
+      reasoningEffort: params.reasoningEffort,
       tools: flags.tools,
       disallowedTools: flags.disallowedTools,
       noSubagents: flags.noSubagents,

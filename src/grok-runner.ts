@@ -77,6 +77,7 @@ export function buildGrokArgv(opts: {
   worktreeRef?: string;
   maxTurns?: number;
   model?: string;
+  reasoningEffort?: string;
   tools?: string[];
   disallowedTools?: string[];
   noSubagents?: boolean;
@@ -111,6 +112,9 @@ export function buildGrokArgv(opts: {
 
   if (opts.maxTurns != null) argv.push("--max-turns", String(opts.maxTurns));
   if (opts.model) argv.push("-m", opts.model);
+  if (opts.reasoningEffort) {
+    argv.push("--reasoning-effort", opts.reasoningEffort);
+  }
 
   if (opts.tools?.length) argv.push("--tools", opts.tools.join(","));
   if (opts.disallowedTools?.length) {

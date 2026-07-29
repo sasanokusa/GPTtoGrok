@@ -18,6 +18,7 @@ export type GrokMcpErrorCode =
   | "GROK_MCP_WORKTREE_INVALID"
   | "GROK_MCP_SESSION_NOT_FOUND"
   | "GROK_MCP_ORIGINAL_TREE_DIRTY"
+  | "GROK_MCP_TESTS_FAILED"
   | "GROK_MCP_INTERNAL";
 
 export interface GrokMcpErrorBody {

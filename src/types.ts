@@ -38,19 +38,17 @@ export const ReasoningEffortSchema = z
   );
 
 /**
- * Reject test_command if present on raw tool args (security: no shell post-hooks).
- * Zod strip would silently drop it; we fail closed instead.
+ * Reject test_command when effective mode is read_only (no shell post-hooks).
+ * write_worktree tools may still run optional test_command after Grok.
  */
-export function rejectTestCommand(args: unknown): void {
-  if (
-    args != null &&
-    typeof args === "object" &&
-    "test_command" in args &&
-    (args as { test_command?: unknown }).test_command !== undefined
-  ) {
+export function rejectTestCommandInReadOnly(
+  mode: ExecutionMode,
+  testCommand: string | undefined,
+): void {
+  if (mode === "read_only" && testCommand !== undefined) {
     throw new GrokMcpError(
       "GROK_MCP_INVALID_ARGS",
-      "test_command is not supported (rejected for security); run tests outside the MCP server",
+      "test_command is not supported in read_only mode; use write_worktree or run tests outside the MCP server",
     );
   }
 }
@@ -62,6 +60,9 @@ export const BaseToolInputSchema = z.object({
   model: z.string().optional(),
   max_turns: z.number().int().positive().optional(),
   reasoning_effort: ReasoningEffortSchema.optional(),
+  test_command: z.string().optional(),
+  test_timeout_ms: z.number().int().positive().optional(),
+  fail_on_test_failure: z.boolean().optional().default(false),
   include_thoughts: z.boolean().optional().default(false),
   verbatim: z.boolean().optional().default(false),
   rules: z.string().optional(),
@@ -125,6 +126,9 @@ export const ContinueInputSchema = z.object({
   model: z.string().optional(),
   max_turns: z.number().int().positive().optional(),
   reasoning_effort: ReasoningEffortSchema.optional(),
+  test_command: z.string().optional(),
+  test_timeout_ms: z.number().int().positive().optional(),
+  fail_on_test_failure: z.boolean().optional().default(false),
   include_thoughts: z.boolean().optional().default(false),
   verbatim: z.boolean().optional().default(false),
   rules: z.string().optional(),
