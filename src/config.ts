@@ -31,6 +31,8 @@ export interface ServerConfig {
   maxPromptDiffBytes: number;
   maxUntrackedFileBytes: number;
   maxStderrBytes: number;
+  /** Hard cap on Grok streaming-json stdout retained by the MCP process. */
+  maxStdoutBytes?: number;
   /**
    * Cap on `tests.output` for a **failing** test run (non-zero exit_code).
    * Passing runs use the smaller `maxTestOutputSuccessBytes` budget instead.
@@ -84,6 +86,9 @@ export const INLINE_DIFF_BYTES_CEILING = 16 * 1024 * 1024;
 /** `0` = unlimited. Truncation is opt-in; oversize alone moves a diff to an artifact. */
 export const DEFAULT_MAX_DIFF_BYTES = 0;
 export const MAX_DIFF_BYTES_CEILING = 512 * 1024 * 1024;
+/** Grok stdout is always bounded; unlike diff limits, zero is not meaningful. */
+export const DEFAULT_MAX_GROK_STDOUT_BYTES = 16 * 1024 * 1024;
+export const MAX_GROK_STDOUT_BYTES_CEILING = 256 * 1024 * 1024;
 /**
  * Defaults + hard ceiling for optional `test_command` output.
  * Failure budget matches the historical hard-coded 64 KiB; success is much
@@ -97,7 +102,7 @@ export const MAX_TEST_OUTPUT_BYTES_CEILING = 16 * 1024 * 1024;
  * Byte-limit env parsing with fail-safe validation.
  * Non-numeric, negative, fractional, NaN and out-of-range values fall back to
  * `fallback` and emit a startup warning on **stderr** (never stdout).
- * `0` is valid and means "never inline".
+ * `0` is valid for limits whose caller defines a zero mode.
  */
 export function parseByteLimitEnv(
   name: string,
@@ -152,6 +157,38 @@ export function sanitizeByteLimit(
     return fallback;
   }
   return value;
+}
+
+function parsePositiveByteLimitEnv(
+  name: string,
+  raw: string | undefined,
+  fallback: number,
+  ceiling: number,
+): number {
+  const value = parseByteLimitEnv(name, raw, fallback, ceiling);
+  if (value > 0) return value;
+  logger.warn("Byte limit must be positive; using default", {
+    env: name,
+    value,
+    default: fallback,
+  });
+  return fallback;
+}
+
+function sanitizePositiveByteLimit(
+  name: string,
+  value: unknown,
+  fallback: number,
+  ceiling: number,
+): number {
+  const sanitized = sanitizeByteLimit(name, value, fallback, ceiling);
+  if (sanitized > 0) return sanitized;
+  logger.warn("Byte limit in config file must be positive; using default", {
+    field: name,
+    value,
+    default: fallback,
+  });
+  return fallback;
 }
 
 function expandHome(p: string): string {
@@ -265,6 +302,17 @@ export function loadConfig(): ServerConfig {
       524_288,
     ),
     maxStderrBytes: parseIntEnv(process.env.GROK_MCP_MAX_STDERR_BYTES, 64_000),
+    maxStdoutBytes: parsePositiveByteLimitEnv(
+      "GROK_MCP_MAX_STDOUT_BYTES",
+      process.env.GROK_MCP_MAX_STDOUT_BYTES,
+      sanitizePositiveByteLimit(
+        "maxStdoutBytes",
+        fileCfg.maxStdoutBytes,
+        DEFAULT_MAX_GROK_STDOUT_BYTES,
+        MAX_GROK_STDOUT_BYTES_CEILING,
+      ),
+      MAX_GROK_STDOUT_BYTES_CEILING,
+    ),
     maxTestOutputBytes: parseByteLimitEnv(
       "GROK_MCP_MAX_TEST_OUTPUT_BYTES",
       process.env.GROK_MCP_MAX_TEST_OUTPUT_BYTES,
