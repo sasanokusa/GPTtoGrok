@@ -48,16 +48,17 @@ export function createServer(config: ServerConfig): McpServer {
     },
   );
 
-  const runner = new GrokRunner(config.maxConcurrent, config.maxQueue);
-  const store = new SessionStore(config.sessionStorePath, config.maxSessions);
+  const runner = new GrokRunner(
+    config.maxConcurrent,
+    config.maxQueue,
+    config.maxStdoutBytes,
+  );
+  const store = new SessionStore(config.sessionStorePath, config.maxSessions, {
+    maxTimeoutMs: config.maxTimeoutMs,
+  });
 
   registerAllTools(server, { config, runner, store });
 
-  // Best-effort GC on start — only managed paths under worktreesRoot that are
-  // registered to the repo. Never recursively remove caller-controlled or
-  // unregistered paths, even if sessions.json is malicious.
-  // Session entries must be managed===true; pending_worktrees are always
-  // server-created and may be reaped without a managed flag.
   void store
     .gc(config.worktreeTtlHours, async (entry) => {
       const wtPath =
@@ -66,7 +67,7 @@ export function createServer(config: ServerConfig): McpServer {
           : undefined;
       const repo =
         "repo_root" in entry && entry.repo_root ? entry.repo_root : undefined;
-      if (!wtPath || !repo) return;
+      if (!wtPath || !repo) return true;
 
       const isSession =
         "session_id" in entry ||
@@ -79,20 +80,17 @@ export function createServer(config: ServerConfig): McpServer {
             worktree_path: wtPath,
             repo_root: repo,
           });
-          return;
+          return true;
         }
       }
 
-      await removeWorktree(repo, wtPath, config.worktreesRoot);
+      return removeWorktree(repo, wtPath, config.worktreesRoot);
     })
     .then((n) => {
       if (n > 0) logger.info("GC removed stale worktrees", { count: n });
     })
     .catch((err) => logger.warn("GC failed", { err: String(err) }));
 
-  // Same TTL GC for compact-mode diff artifacts. Only validated managed
-  // artifacts under `<cacheDir>/diffs` are removed — never symlinks, files
-  // outside the cache root, or unmanaged names.
   void gcDiffArtifacts(config.cacheDir, config.worktreeTtlHours)
     .then((n) => {
       if (n > 0) logger.info("GC removed stale diff artifacts", { count: n });

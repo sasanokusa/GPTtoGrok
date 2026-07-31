@@ -37,6 +37,71 @@ function initRepo(): string {
 }
 
 describe("assembleDiff", () => {
+  it("collects full tracked diff without per-path argv expansion", async () => {
+    const repo = initRepo();
+    // Many tracked changes — path-list argv expansion is what we avoid.
+    for (let i = 0; i < 20; i++) {
+      fs.writeFileSync(path.join(repo, `f${i}.txt`), `base-${i}\n`);
+    }
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "many files"], { cwd: repo });
+    for (let i = 0; i < 20; i++) {
+      fs.writeFileSync(path.join(repo, `f${i}.txt`), `changed-${i}\n`);
+    }
+    fs.writeFileSync(path.join(repo, ".env"), "SECRET=1\n");
+
+    const result = await assembleDiff(repo, secretCfg, {
+      maxUntrackedFileBytes: 500_000,
+    });
+
+    expect(result.changedFiles).toContain("f0.txt");
+    expect(result.changedFiles).not.toContain(".env");
+    expect(result.diff).toContain("changed-0");
+    expect(result.diff).toContain("changed-19");
+    expect(result.diff).not.toContain("SECRET=1");
+    expect(result.warnings).toContain("REDACTED_SECRET_PATHS");
+    expect(result.complete).toBe(false);
+  });
+
+  it("marks complete=false for secret-only tracked changes (empty usable patch)", async () => {
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, ".env"), "PLACEHOLDER=1\n");
+    execFileSync("git", ["add", ".env"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "secret"], { cwd: repo });
+    fs.writeFileSync(path.join(repo, ".env"), "PLACEHOLDER=2\n");
+
+    const result = await assembleDiff(repo, secretCfg, {
+      maxUntrackedFileBytes: 500_000,
+    });
+    expect(result.complete).toBe(false);
+    expect(result.warnings).toContain("REDACTED_SECRET_PATHS");
+    expect(result.diff).not.toContain("PLACEHOLDER");
+    expect(result.changedFiles).not.toContain(".env");
+  });
+
+  it("marks complete=false when an untracked path cannot produce a patch", async () => {
+    const repo = initRepo();
+    const missingTarget = path.join(repo, "definitely-missing-target");
+    const link = path.join(repo, "broken-untracked");
+    // Dangling symlink: status usually lists it; stat/read fails closed.
+    fs.symlinkSync(missingTarget, link);
+
+    const result = await assembleDiff(repo, secretCfg, {
+      maxUntrackedFileBytes: 500_000,
+    });
+    if (result.changedFiles.includes("broken-untracked")) {
+      expect(result.complete).toBe(false);
+      expect(
+        result.warnings.some((w) =>
+          ["UNTRACKED_DIFF_FAILED", "UNTRACKED_NON_FILE_SKIPPED"].includes(w),
+        ),
+      ).toBe(true);
+    } else {
+      // Some git/status configurations omit broken symlinks from -uall.
+      expect(result.complete).toBe(true);
+    }
+  });
+
   it("includes untracked files with apply-friendly relative headers", () => {
     const repo = initRepo();
     fs.writeFileSync(path.join(repo, "newfile.txt"), "content-a\n");
@@ -259,6 +324,54 @@ describe("getDiffVsRef", () => {
     ).rejects.toMatchObject({
       code: "GROK_MCP_INVALID_ARGS",
     });
+  });
+
+  it("reports complete=false and warnings when secret paths are filtered", async () => {
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, "normal.ts"), "export const a = 1;\n");
+    fs.writeFileSync(path.join(repo, ".env"), "PLACEHOLDER_ENV=base\n");
+    execFileSync("git", ["add", "normal.ts", ".env"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "base"], { cwd: repo });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repo,
+      encoding: "utf8",
+    }).trim();
+
+    fs.writeFileSync(path.join(repo, "normal.ts"), "export const a = 2;\n");
+    fs.writeFileSync(path.join(repo, ".env"), "PLACEHOLDER_ENV=tip\n");
+    execFileSync("git", ["add", "normal.ts", ".env"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "tip"], { cwd: repo });
+
+    const result = await getDiffVsRef(repo, baseSha, 1_000_000, secretCfg);
+    expect(result.empty).toBe(false);
+    expect(result.complete).toBe(false);
+    expect(result.warnings).toContain("REDACTED_SECRET_PATHS");
+    expect(result.diff).toContain("normal.ts");
+    expect(result.diff).not.toContain(".env");
+  });
+
+  it("does not expand per-path argv for large change sets", async () => {
+    const repo = initRepo();
+    for (let i = 0; i < 30; i++) {
+      fs.writeFileSync(path.join(repo, `n${i}.ts`), `export const n = ${i};\n`);
+    }
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "base many"], { cwd: repo });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repo,
+      encoding: "utf8",
+    }).trim();
+    for (let i = 0; i < 30; i++) {
+      fs.writeFileSync(path.join(repo, `n${i}.ts`), `export const n = ${i + 1};\n`);
+    }
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "tip many"], { cwd: repo });
+
+    const result = await getDiffVsRef(repo, baseSha, 5_000_000, secretCfg);
+    expect(result.empty).toBe(false);
+    expect(result.complete).toBe(true);
+    expect(result.diff).toContain("n0.ts");
+    expect(result.diff).toContain("n29.ts");
   });
 });
 

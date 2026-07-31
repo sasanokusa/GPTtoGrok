@@ -27,8 +27,14 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
       },
     },
     async (args, extra) => {
+      let leasedSessionId: string | undefined;
       try {
         const input = parseToolInput(ContinueInputSchema, args);
+
+        // Acquire the cross-process lease before reading the persistent record.
+        // This closes the check/use window against startup GC in another MCP process.
+        ctx.store.markRunning(input.session_id);
+        leasedSessionId = input.session_id;
 
         if (input.mode === "write_worktree" && input.allow_missing_worktree) {
           throw new GrokMcpError(
@@ -56,7 +62,6 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
         const warnings: string[] = [];
 
         if (mode === "write_worktree") {
-          // Fail closed: write continue requires a stored MCP session record.
           if (!stored) {
             throw new GrokMcpError(
               "GROK_MCP_SESSION_NOT_FOUND",
@@ -105,7 +110,6 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
         }
 
         if (mode === "write_worktree") {
-          // Re-check after possible downgrade above
           const storedPath = stored!.worktree_path!;
           const exists = await pathExists(storedPath);
           const callerExists = input.worktree_path
@@ -131,7 +135,6 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
         }
 
         if (mode === "write_worktree") {
-          // Full path/mode/repo/registration guards for write continue
           const storedReal = await resolveWorktreeRealpath(stored!.worktree_path!);
           let candidateReal = storedReal;
           if (input.worktree_path) {
@@ -213,7 +216,6 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
           sandbox: input.sandbox,
           allowWeb: input.allow_web,
           allowSubagents: input.allow_subagents,
-          // Per-call: never inherited from the resumed session record.
           responseMode: input.response_mode,
           keepWorktree: input.keep_worktree,
           resumeSessionId: input.session_id,
@@ -237,6 +239,8 @@ export function registerContinue(server: McpServer, ctx: ToolContext): void {
           isError: true,
           content: [{ type: "text" as const, text: e.text }],
         };
+      } finally {
+        if (leasedSessionId) ctx.store.markDone(leasedSessionId);
       }
     },
   );
