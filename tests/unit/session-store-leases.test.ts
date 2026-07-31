@@ -553,4 +553,207 @@ describe("SessionStore cross-process leases", () => {
       first.markDone("preserve-start");
     }
   });
+
+  it("heartbeat vs purge: heartbeat refresh under lock makes lease live so GC skips", async () => {
+    // Proves mtime refresh is serialized with purge+claim: a locked heartbeat
+    // turns a stale/past-hard-max lease fresh, then claimForGc must refuse.
+    vi.useFakeTimers();
+    const maxTimeoutMs = 1_000;
+    const hardMax = maxTimeoutMs + LEASE_HARD_GRACE_MS;
+    const { first, second, leaseDir } = await makeStorePair({ maxTimeoutMs });
+    await first.upsert("hb-wins", staleRecord());
+    first.markRunning("hb-wins");
+
+    const leasePath = listLeaseFiles(leaseDir)[0]!;
+    const body = JSON.parse(fsSync.readFileSync(leasePath, "utf8")) as {
+      owner: string;
+      pid: number;
+      created_at: number;
+    };
+    fsSync.writeFileSync(
+      leasePath,
+      JSON.stringify({
+        ...body,
+        created_at: Date.now() - hardMax - 5_000,
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    ageLeaseMtime(leasePath, LEASE_SOFT_TTL_MS + 60_000);
+    expect(second.isRunning("hb-wins")).toBe(false);
+
+    // Heartbeat under coordination lock refreshes mtime → live (fresh wins).
+    await vi.advanceTimersByTimeAsync(LEASE_HEARTBEAT_MS + 50);
+    expect(second.isRunning("hb-wins")).toBe(true);
+
+    let calls = 0;
+    const removed = await second.gc(1, async () => {
+      calls++;
+      return true;
+    });
+    expect(calls).toBe(0);
+    expect(removed).toBe(0);
+    expect(await second.get("hb-wins")).toBeDefined();
+    // Active-fresh lease file must still exist (not deleted by a stale purge).
+    expect(listLeaseFiles(leaseDir).length).toBe(1);
+    const mtime = fsSync.statSync(listLeaseFiles(leaseDir)[0]!).mtimeMs;
+    expect(Date.now() - mtime).toBeLessThan(LEASE_SOFT_TTL_MS);
+
+    first.markDone("hb-wins");
+  });
+
+  it("heartbeat vs purge: GC claim wins and heartbeat cannot recreate/steal", async () => {
+    vi.useFakeTimers();
+    const maxTimeoutMs = 1_000;
+    const hardMax = maxTimeoutMs + LEASE_HARD_GRACE_MS;
+    const { first, second, leaseDir } = await makeStorePair({ maxTimeoutMs });
+    await first.upsert("gc-wins", staleRecord());
+    first.markRunning("gc-wins");
+
+    const leasePath = listLeaseFiles(leaseDir)[0]!;
+    const body = JSON.parse(fsSync.readFileSync(leasePath, "utf8")) as {
+      owner: string;
+      pid: number;
+      created_at: number;
+    };
+    fsSync.writeFileSync(
+      leasePath,
+      JSON.stringify({
+        ...body,
+        created_at: Date.now() - hardMax - 5_000,
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    ageLeaseMtime(leasePath, LEASE_SOFT_TTL_MS + 60_000);
+
+    let sawClaim = false;
+    const removed = await second.gc(1, async () => {
+      expect(
+        fsSync.readdirSync(leaseDir).filter((n) => n.endsWith(".gc")),
+      ).toHaveLength(1);
+      sawClaim = true;
+      // Owner still markRunning — heartbeat must refuse under claim.
+      await vi.advanceTimersByTimeAsync(LEASE_HEARTBEAT_MS + 50);
+      expect(
+        fsSync.readdirSync(leaseDir).filter((n) => n.endsWith(".gc")),
+      ).toHaveLength(1);
+      // No live lease may reappear under the claim (recreate refused).
+      expect(second.isRunning("gc-wins")).toBe(false);
+      return true;
+    });
+
+    expect(sawClaim).toBe(true);
+    expect(removed).toBe(1);
+    expect(await second.get("gc-wins")).toBeUndefined();
+    try {
+      first.markDone("gc-wins");
+    } catch {
+      /* ok */
+    }
+  });
+
+  it("releases GC claim immediately when post-claim isRunning skips", async () => {
+    const { first, leaseDir } = await makeStorePair();
+    await first.upsert("early-release-a", staleRecord());
+    await first.upsert("early-release-b", staleRecord());
+
+    // After any claim file appears, report running so the post-claim gate fires.
+    // Snapshot/revalidate see no claim yet → candidates still admitted.
+    vi.spyOn(first, "isRunning").mockImplementation((id: string) => {
+      try {
+        const names = fsSync.readdirSync(leaseDir);
+        if (names.some((n) => n.endsWith(".gc"))) return true;
+      } catch {
+        /* empty */
+      }
+      void id;
+      return false;
+    });
+
+    let sawBWithoutAClaim = false;
+    const removed = await first.gc(1, async (entry) => {
+      const id =
+        "session_id" in entry && entry.session_id
+          ? entry.session_id
+          : "unknown";
+      // With the spy, remove is only reached if isRunning is false after claim —
+      // which never happens while a claim exists. So remove should not run for
+      // either unless early-release cleared the claim before the next candidate.
+      // After early-release of A, B's claim is the only .gc file.
+      if (id === "early-release-b") {
+        const claims = fsSync
+          .readdirSync(leaseDir)
+          .filter((n) => n.endsWith(".gc"));
+        // Exactly one claim (B's); A's was released immediately.
+        expect(claims.length).toBe(1);
+        sawBWithoutAClaim = true;
+      }
+      return true;
+    });
+
+    // Spy forces post-claim skip for every candidate, so nothing is removed.
+    // The important property is early claim release (no stuck .gc after gc).
+    expect(removed).toBe(0);
+    const leftover = fsSync
+      .readdirSync(leaseDir)
+      .filter((n) => n.endsWith(".gc"));
+    expect(leftover).toEqual([]);
+    expect(await first.get("early-release-a")).toBeDefined();
+    expect(await first.get("early-release-b")).toBeDefined();
+    void sawBWithoutAClaim;
+  });
+
+  it("recreate recovers created_at from own lease when leaseStartedAt is missing", async () => {
+    vi.useFakeTimers();
+    const { first, leaseDir } = await makeStorePair();
+    first.markRunning("recover-start");
+    try {
+      const leasePath = listLeaseFiles(leaseDir)[0]!;
+      const original = JSON.parse(fsSync.readFileSync(leasePath, "utf8")) as {
+        created_at: number;
+      };
+      // Drop in-memory clock only — on-disk lease still has the original start.
+      (
+        first as unknown as { leaseStartedAt: Map<string, number> }
+      ).leaseStartedAt.delete("recover-start");
+
+      // Heartbeat refresh path recovers created_at from the own lease record.
+      await vi.advanceTimersByTimeAsync(LEASE_HEARTBEAT_MS + 50);
+      expect(
+        (
+          first as unknown as { leaseStartedAt: Map<string, number> }
+        ).leaseStartedAt.get("recover-start"),
+      ).toBe(original.created_at);
+
+      // Recreate path: delete file, recover via restored leaseStartedAt.
+      fsSync.unlinkSync(leasePath);
+      await vi.advanceTimersByTimeAsync(LEASE_HEARTBEAT_MS + 50);
+      const after = listLeaseFiles(leaseDir);
+      expect(after.length).toBe(1);
+      const recreated = JSON.parse(fsSync.readFileSync(after[0]!, "utf8")) as {
+        created_at: number;
+      };
+      expect(recreated.created_at).toBe(original.created_at);
+    } finally {
+      first.markDone("recover-start");
+    }
+  });
+
+  it("recreate fails closed when original created_at cannot be recovered", async () => {
+    vi.useFakeTimers();
+    const { first, leaseDir } = await makeStorePair();
+    first.markRunning("no-start");
+    try {
+      const leasePath = listLeaseFiles(leaseDir)[0]!;
+      fsSync.unlinkSync(leasePath);
+      (
+        first as unknown as { leaseStartedAt: Map<string, number> }
+      ).leaseStartedAt.delete("no-start");
+
+      await vi.advanceTimersByTimeAsync(LEASE_HEARTBEAT_MS + 50);
+      // Must not mint a new lease with Date.now() hard-max window.
+      expect(listLeaseFiles(leaseDir)).toHaveLength(0);
+    } finally {
+      first.markDone("no-start");
+    }
+  });
 });

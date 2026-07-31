@@ -28,9 +28,10 @@ const LOCK_HEARTBEAT_MS = 2_000;
 //    (PID reuse / silent stuck owner); recreation must not reset created_at.
 // 3. Stale heartbeat + (dead PID | past hard max | unparseable) ⇒ collectible.
 //
-// Dead-lease unlinks happen only under the coordination lock together with GC
-// claim acquisition (never during a pure isRunning probe), so a concurrent
-// heartbeat cannot observe a gap and mint a fresh hard-max window.
+// Dead-lease unlinks and heartbeat mtime refresh both run under the same
+// per-id coordination lock as GC claim acquisition (never a pure isRunning
+// probe, never unlocked utimes). Heartbeat and purge+claim are mutually
+// exclusive: GC cannot lstat-stale then unlink after a concurrent refresh.
 /** Soft lease freshness window based on mtime/heartbeat. Exported for tests. */
 export const LEASE_SOFT_TTL_MS = 5 * 60_000;
 /** @deprecated Use LEASE_SOFT_TTL_MS. Kept for older test imports. */
@@ -143,10 +144,17 @@ export class SessionStore {
         );
       }
       this.purgeDeadLeasesLocked(sessionOrRunId);
+      // Brand-new run: mint the original start once. Recreate paths never do this.
       if (!this.leaseStartedAt.has(sessionOrRunId)) {
         this.leaseStartedAt.set(sessionOrRunId, Date.now());
       }
-      this.writeLeaseLocked(sessionOrRunId);
+      if (!this.writeLeaseLocked(sessionOrRunId)) {
+        throw new GrokMcpError(
+          "GROK_MCP_INTERNAL",
+          "Failed to write session lease",
+          { session_id: sessionOrRunId },
+        );
+      }
     });
 
     this.runningCounts.set(sessionOrRunId, 1);
@@ -206,24 +214,49 @@ export class SessionStore {
   }
 
   /**
-   * Refresh lease mtime; on failure recreate while preserving the original
-   * lease start (hard-max clock). Never recreate under a foreign GC claim or
-   * a foreign live lease.
+   * Refresh lease mtime (or recreate if missing) under the same per-id
+   * coordination lock as GC purge+claim. Never utimes outside the lock — that
+   * raced with lstat/classify/unlink and could delete an active-fresh lease.
+   *
+   * Under the lock: re-check runningCounts, refuse GC claim / foreign live
+   * lease, verify own lease identity, preserve original created_at.
    */
   private renewLeaseHeartbeat(sessionOrRunId: string): void {
     if ((this.runningCounts.get(sessionOrRunId) ?? 0) <= 0) return;
-    const lease = this.leasePath(sessionOrRunId);
-    try {
-      const now = new Date();
-      fs.utimesSync(lease, now, now);
-      return;
-    } catch {
-      /* fall through to recreate */
-    }
 
     try {
       this.withCoordinationLockSync(sessionOrRunId, () => {
         if ((this.runningCounts.get(sessionOrRunId) ?? 0) <= 0) return;
+
+        if (this.readActiveClaimLocked(sessionOrRunId)) {
+          logger.warn(
+            "Lease heartbeat skipped; GC claim owns id",
+            { id: sessionOrRunId },
+          );
+          return;
+        }
+        if (this.hasForeignActiveLeaseLocked(sessionOrRunId)) {
+          logger.warn(
+            "Lease heartbeat skipped; foreign active lease owns id",
+            { id: sessionOrRunId },
+          );
+          return;
+        }
+
+        const ownPath = this.leasePath(sessionOrRunId);
+        const ownRec = this.readOwnLeaseRecordLocked(sessionOrRunId);
+        if (ownRec && ownRec.owner === this.ownerId) {
+          // Refresh mtime only — never rewrite created_at.
+          if (!this.leaseStartedAt.has(sessionOrRunId)) {
+            this.leaseStartedAt.set(sessionOrRunId, ownRec.created_at);
+          }
+          const now = new Date();
+          fs.utimesSync(ownPath, now, now);
+          return;
+        }
+
+        // Own lease missing or unreadable — safe recreate only with a known
+        // original start. Never Date.now() a new hard-max window here.
         if (this.readActiveClaimLocked(sessionOrRunId)) {
           logger.warn(
             "Lease heartbeat lost and GC claim owns id; cannot recreate",
@@ -231,18 +264,20 @@ export class SessionStore {
           );
           return;
         }
-        if (this.hasForeignActiveLeaseLocked(sessionOrRunId)) {
+        const started = this.resolveLeaseStartedAtLocked(sessionOrRunId);
+        if (started == null) {
           logger.warn(
-            "Lease heartbeat lost and foreign active lease owns id; cannot recreate",
+            "Cannot recreate lease without original created_at; fail closed",
             { id: sessionOrRunId },
           );
           return;
         }
-        // Preserve original started_at — never mint a new hard-max window.
-        if (!this.leaseStartedAt.has(sessionOrRunId)) {
-          this.leaseStartedAt.set(sessionOrRunId, Date.now());
+        if (!this.writeLeaseLocked(sessionOrRunId)) {
+          logger.warn("Failed to write recreated session lease", {
+            id: sessionOrRunId,
+          });
+          return;
         }
-        this.writeLeaseLocked(sessionOrRunId);
         logger.warn("Recreated session lease after heartbeat failure", {
           id: sessionOrRunId,
         });
@@ -255,12 +290,55 @@ export class SessionStore {
     }
   }
 
-  private writeLeaseLocked(sessionOrRunId: string): void {
-    const createdAt =
-      this.leaseStartedAt.get(sessionOrRunId) ?? Date.now();
-    if (!this.leaseStartedAt.has(sessionOrRunId)) {
-      this.leaseStartedAt.set(sessionOrRunId, createdAt);
+  /**
+   * Resolve original lease start under the coordination lock.
+   * Never invents a new hard-max window via Date.now() on the recreate path.
+   */
+  private resolveLeaseStartedAtLocked(sessionOrRunId: string): number | null {
+    const cached = this.leaseStartedAt.get(sessionOrRunId);
+    if (cached != null && Number.isFinite(cached)) return cached;
+
+    const own = this.readOwnLeaseRecordLocked(sessionOrRunId);
+    if (
+      own &&
+      own.owner === this.ownerId &&
+      typeof own.created_at === "number" &&
+      Number.isFinite(own.created_at)
+    ) {
+      this.leaseStartedAt.set(sessionOrRunId, own.created_at);
+      return own.created_at;
     }
+    return null;
+  }
+
+  /** Read this process's lease file if present and well-formed. */
+  private readOwnLeaseRecordLocked(sessionOrRunId: string): LeaseRecord | null {
+    const ownPath = this.leasePath(sessionOrRunId);
+    try {
+      const stat = fs.lstatSync(ownPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) return null;
+      const raw = JSON.parse(fs.readFileSync(ownPath, "utf8")) as Partial<LeaseRecord>;
+      if (
+        typeof raw.owner === "string" &&
+        typeof raw.pid === "number" &&
+        typeof raw.created_at === "number"
+      ) {
+        return raw as LeaseRecord;
+      }
+    } catch {
+      /* missing or corrupt */
+    }
+    return null;
+  }
+
+  /**
+   * Write this process's lease file. Requires a known original created_at
+   * (leaseStartedAt or recoverable from the existing own lease). Returns false
+   * rather than minting a new hard-max window when the start is unknown.
+   */
+  private writeLeaseLocked(sessionOrRunId: string): boolean {
+    const createdAt = this.resolveLeaseStartedAtLocked(sessionOrRunId);
+    if (createdAt == null) return false;
     const record: LeaseRecord = {
       owner: this.ownerId,
       pid: process.pid,
@@ -270,6 +348,7 @@ export class SessionStore {
       encoding: "utf8",
       mode: 0o600,
     });
+    return true;
   }
 
   async withLock<T>(fn: (data: SessionStoreData) => Promise<T> | T): Promise<T> {
@@ -397,8 +476,16 @@ export class SessionStore {
     };
     const succeededPending: SucceededPending[] = [];
     const succeededSessions: SucceededSession[] = [];
-    const claims: Array<{ id: string; token: string; renew: NodeJS.Timeout }> =
-      [];
+    type ClaimEntry = { id: string; token: string; renew: NodeJS.Timeout };
+    const claims: ClaimEntry[] = [];
+
+    /** Clear renew timer + release claim now; finally remains an idempotent backstop. */
+    const dropClaimEarly = (entry: ClaimEntry): void => {
+      clearInterval(entry.renew);
+      this.releaseGcClaim(entry.id, entry.token);
+      const idx = claims.indexOf(entry);
+      if (idx >= 0) claims.splice(idx, 1);
+    };
 
     try {
       for (const c of candidates) {
@@ -416,12 +503,19 @@ export class SessionStore {
           if (!this.renewGcClaim(c.id, token)) claimHealthy = false;
         }, GC_CLAIM_RENEW_MS);
         if (typeof renew.unref === "function") renew.unref();
-        claims.push({ id: c.id, token, renew });
+        const claimEntry: ClaimEntry = { id: c.id, token, renew };
+        claims.push(claimEntry);
 
         try {
           // Re-check lease after claim (claim holds exclusivity vs markRunning).
           if (this.isRunning(c.id)) {
-            logger.warn("Skipping GC; became running after claim", { id: c.id });
+            logger.warn("Skipping GC; became running after claim", {
+              id: c.id,
+              path: pre.entry.worktree_path,
+            });
+            // Free the id immediately so another resume is not blocked until
+            // the rest of multi-candidate GC finishes.
+            dropClaimEarly(claimEntry);
             continue;
           }
 
@@ -468,7 +562,8 @@ export class SessionStore {
               : "Failed to GC session worktree",
             {
               id: c.id,
-              path: c.entry.worktree_path,
+              // Prefer revalidated path (snapshot may be stale).
+              path: pre.entry.worktree_path,
               err: String(err),
             },
           );
@@ -531,6 +626,8 @@ export class SessionStore {
 
       return removed;
     } finally {
+      // Idempotent backstop: early drops already cleared+released; releaseGcClaim
+      // no-ops when the token no longer owns the claim.
       for (const claim of claims) {
         clearInterval(claim.renew);
         this.releaseGcClaim(claim.id, claim.token);
