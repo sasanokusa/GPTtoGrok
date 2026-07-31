@@ -19,17 +19,24 @@ const LOCK_HEARTBEAT_MS = 2_000;
 // startup GC. Lease files are deliberately separate from sessions.json so a
 // heartbeat never rewrites the whole store.
 //
-// Soft TTL (mtime): a fresh heartbeat always counts as live.
-// Hard max: even a live PID cannot block GC past max tool duration + grace —
-// covers crashed hosts and PID reuse without leaving worktrees uncollectible.
-// PID liveness: a process suspended longer than the soft TTL still holds the
-// lease while its OS process is alive and under the hard max.
+// Liveness (see leaseIsLive) — maxTimeoutMs is NOT a wall-clock bound on the
+// full run (queue wait + Grok timeout + test timeout + cleanup), so:
+// 1. Fresh heartbeat mtime ⇒ live regardless of created_at. Never GC an
+//    actively heartbeating owner solely because created_at is old.
+// 2. Stale heartbeat + live owner PID + age ≤ hard max ⇒ live (suspend /
+//    debugger pause). Hard max bounds this PID-liveness extension only
+//    (PID reuse / silent stuck owner); recreation must not reset created_at.
+// 3. Stale heartbeat + (dead PID | past hard max | unparseable) ⇒ collectible.
+//
+// Dead-lease unlinks happen only under the coordination lock together with GC
+// claim acquisition (never during a pure isRunning probe), so a concurrent
+// heartbeat cannot observe a gap and mint a fresh hard-max window.
 /** Soft lease freshness window based on mtime/heartbeat. Exported for tests. */
 export const LEASE_SOFT_TTL_MS = 5 * 60_000;
 /** @deprecated Use LEASE_SOFT_TTL_MS. Kept for older test imports. */
 export const LEASE_TTL_MS = LEASE_SOFT_TTL_MS;
 export const LEASE_HEARTBEAT_MS = 10_000;
-/** Extra grace beyond max tool duration before a live-PID lease is reaped. */
+/** Extra grace beyond max tool duration before a lease is reaped by hard max. */
 export const LEASE_HARD_GRACE_MS = 5 * 60_000;
 /** Default hard max when caller does not pass maxTimeoutMs (matches config). */
 export const DEFAULT_LEASE_HARD_MAX_MS = 3_600_000 + LEASE_HARD_GRACE_MS;
@@ -42,6 +49,7 @@ const SYNC_WAIT = new Int32Array(new SharedArrayBuffer(4));
 interface LeaseRecord {
   owner: string;
   pid: number;
+  /** Original lease start; never advanced by heartbeat recreation. */
   created_at: number;
 }
 
@@ -52,10 +60,11 @@ interface GcClaim {
 
 export interface SessionStoreOptions {
   /**
-   * Maximum tool duration this process may run (ms). Bounds the PID-liveness
-   * extension when heartbeats go stale: `maxTimeoutMs + LEASE_HARD_GRACE_MS`.
-   * Fresh heartbeats always protect the run; hard max only limits how long a
-   * silent-but-alive PID can block GC after soft TTL (covers crash + PID reuse).
+   * Configured max tool duration (ms). Bounds only the *stale-heartbeat*
+   * PID-liveness extension: `maxTimeoutMs + LEASE_HARD_GRACE_MS` from the
+   * original lease `created_at`. Fresh heartbeats remain live past this age
+   * because total active wall time can exceed maxTimeoutMs (queue + run +
+   * tests + cleanup). Crashed owners (dead PID + stale mtime) stay collectible.
    */
   maxTimeoutMs?: number;
 }
@@ -80,10 +89,15 @@ export class SessionStore {
   private readonly leaseDir: string;
   private readonly ownerId: string;
   private readonly maxSessions: number;
-  /** Hard ceiling for lease age even when the owner PID is still alive. */
+  /** Hard ceiling for lease age from original created_at. */
   private readonly leaseHardMaxMs: number;
   private readonly runningCounts = new Map<string, number>();
   private readonly leaseHeartbeats = new Map<string, NodeJS.Timeout>();
+  /**
+   * Original lease start per id for this process. Heartbeat recreation must
+   * reuse this so hard-max reclamation cannot be defeated by a new created_at.
+   */
+  private readonly leaseStartedAt = new Map<string, number>();
 
   constructor(
     filePath: string,
@@ -118,6 +132,20 @@ export class SessionStore {
           { session_id: sessionOrRunId },
         );
       }
+      // Single-resumer: refuse if another owner still holds a live lease.
+      // Dead/expired foreign leases are purged here so we can take over after
+      // a crash without leaving the id permanently stuck.
+      if (this.hasForeignActiveLeaseLocked(sessionOrRunId)) {
+        throw new GrokMcpError(
+          "GROK_MCP_BUSY",
+          "Session or run already has an active lease from another MCP process",
+          { session_id: sessionOrRunId },
+        );
+      }
+      this.purgeDeadLeasesLocked(sessionOrRunId);
+      if (!this.leaseStartedAt.has(sessionOrRunId)) {
+        this.leaseStartedAt.set(sessionOrRunId, Date.now());
+      }
       this.writeLeaseLocked(sessionOrRunId);
     });
 
@@ -136,6 +164,7 @@ export class SessionStore {
       return;
     }
     this.runningCounts.delete(sessionOrRunId);
+    this.leaseStartedAt.delete(sessionOrRunId);
     const heartbeat = this.leaseHeartbeats.get(sessionOrRunId);
     if (heartbeat) clearInterval(heartbeat);
     this.leaseHeartbeats.delete(sessionOrRunId);
@@ -161,8 +190,10 @@ export class SessionStore {
   isRunning(id: string): boolean {
     if ((this.runningCounts.get(id) ?? 0) > 0) return true;
     try {
+      // Probe only — never unlink dead leases here. Unlink+claim must be atomic
+      // under claimForGc so a concurrent heartbeat cannot fill the gap.
       return this.withCoordinationLockSync(id, () =>
-        this.hasActiveLeaseLocked(id),
+        this.hasActiveLeaseLocked(id, { purgeDead: false }),
       );
     } catch (err) {
       // Fail closed: coordination failure must not allow GC/pruning.
@@ -175,10 +206,9 @@ export class SessionStore {
   }
 
   /**
-   * Refresh lease mtime; on failure (e.g. lease reaped during a long suspend)
-   * recreate the lease only while this process still holds the running count
-   * and no foreign GC claim owns the id. Heartbeat failures must not silently
-   * make an active worktree collectible.
+   * Refresh lease mtime; on failure recreate while preserving the original
+   * lease start (hard-max clock). Never recreate under a foreign GC claim or
+   * a foreign live lease.
    */
   private renewLeaseHeartbeat(sessionOrRunId: string): void {
     if ((this.runningCounts.get(sessionOrRunId) ?? 0) <= 0) return;
@@ -201,7 +231,17 @@ export class SessionStore {
           );
           return;
         }
-        // Recreate even if another stale lease file for this owner disappeared.
+        if (this.hasForeignActiveLeaseLocked(sessionOrRunId)) {
+          logger.warn(
+            "Lease heartbeat lost and foreign active lease owns id; cannot recreate",
+            { id: sessionOrRunId },
+          );
+          return;
+        }
+        // Preserve original started_at — never mint a new hard-max window.
+        if (!this.leaseStartedAt.has(sessionOrRunId)) {
+          this.leaseStartedAt.set(sessionOrRunId, Date.now());
+        }
         this.writeLeaseLocked(sessionOrRunId);
         logger.warn("Recreated session lease after heartbeat failure", {
           id: sessionOrRunId,
@@ -216,10 +256,15 @@ export class SessionStore {
   }
 
   private writeLeaseLocked(sessionOrRunId: string): void {
+    const createdAt =
+      this.leaseStartedAt.get(sessionOrRunId) ?? Date.now();
+    if (!this.leaseStartedAt.has(sessionOrRunId)) {
+      this.leaseStartedAt.set(sessionOrRunId, createdAt);
+    }
     const record: LeaseRecord = {
       owner: this.ownerId,
       pid: process.pid,
-      created_at: Date.now(),
+      created_at: createdAt,
     };
     fs.writeFileSync(this.leasePath(sessionOrRunId), JSON.stringify(record), {
       encoding: "utf8",
@@ -277,12 +322,16 @@ export class SessionStore {
   /**
    * GC stale pending worktrees and sessions.
    *
+   * Candidates are snapshotted first, but each id is re-validated against the
+   * live store (created_at / last_used_at vs cutoff, worktree path, active
+   * lease) immediately before claim/removal and again before committing the
+   * persistent-record deletion. A resume/touch after the snapshot therefore
+   * cannot lose its worktree.
+   *
    * Each candidate is claimed using a cross-process coordination file before
-   * slow removal begins. `markRunning` refuses a live claim, so another MCP
-   * process cannot resume the same session between the lease check and rm.
-   * The persistent record is removed only when the callback does not return
-   * `false`; failed worktree removals remain retryable instead of becoming
-   * orphaned directories.
+   * slow removal begins. `markRunning` refuses a live claim or foreign live
+   * lease. Dead leases are purged only under the claim lock (atomic with the
+   * claim write).
    */
   async gc(
     ttlHours: number,
@@ -296,11 +345,14 @@ export class SessionStore {
       kind: "pending";
       id: string;
       entry: PendingWorktree;
+      /** Snapshot timestamps used to detect refresh before commit. */
+      stamp: string;
     };
     type SessionCandidate = {
       kind: "session";
       id: string;
       entry: SessionRecord;
+      stamp: string;
     };
     type Candidate = PendingCandidate | SessionCandidate;
 
@@ -310,26 +362,50 @@ export class SessionStore {
         if (this.isRunning(p.run_id)) continue;
         const t = Date.parse(p.created_at);
         if (!Number.isNaN(t) && t < cutoff) {
-          out.push({ kind: "pending", id: p.run_id, entry: p });
+          out.push({
+            kind: "pending",
+            id: p.run_id,
+            entry: { ...p },
+            stamp: p.created_at,
+          });
         }
       }
       for (const [id, rec] of Object.entries(data.sessions)) {
         if (this.isRunning(id)) continue;
         const t = Date.parse(rec.last_used_at);
         if (!Number.isNaN(t) && t < cutoff) {
-          out.push({ kind: "session", id, entry: rec });
+          out.push({
+            kind: "session",
+            id,
+            entry: { ...rec },
+            stamp: rec.last_used_at,
+          });
         }
       }
       return out;
     });
 
-    const succeededPending = new Set<string>();
-    const succeededSessions = new Set<string>();
+    type SucceededPending = {
+      id: string;
+      stamp: string;
+      worktree_path: string | undefined;
+    };
+    type SucceededSession = {
+      id: string;
+      stamp: string;
+      worktree_path: string | undefined;
+    };
+    const succeededPending: SucceededPending[] = [];
+    const succeededSessions: SucceededSession[] = [];
     const claims: Array<{ id: string; token: string; renew: NodeJS.Timeout }> =
       [];
 
     try {
       for (const c of candidates) {
+        // Freshness gate #1: record may have been resumed/touched after snapshot.
+        const pre = await this.revalidateGcCandidate(c, cutoff);
+        if (!pre.ok) continue;
+
         const token = this.claimForGc(c.id);
         if (!token) continue;
         // Renew claim expiry for the whole removal — long `rm -rf` / network
@@ -343,29 +419,48 @@ export class SessionStore {
         claims.push({ id: c.id, token, renew });
 
         try {
+          // Re-check lease after claim (claim holds exclusivity vs markRunning).
+          if (this.isRunning(c.id)) {
+            logger.warn("Skipping GC; became running after claim", { id: c.id });
+            continue;
+          }
+
           const result =
             c.kind === "pending"
-              ? await removeWorktree(c.entry)
-              : await removeWorktree({ ...c.entry, session_id: c.id });
+              ? await removeWorktree(pre.entry as PendingWorktree)
+              : await removeWorktree({
+                  ...(pre.entry as SessionRecord),
+                  session_id: c.id,
+                });
           if (result === false) {
             logger.warn("GC callback reported worktree still present", {
               id: c.id,
-              path: c.entry.worktree_path,
+              path: pre.entry.worktree_path,
             });
             continue;
           }
-          // Re-validate ownership after slow removal. A lost/expired claim means
-          // another process may have claimed the id — leave the store record so
-          // GC can retry rather than silently dropping bookkeeping.
+          // Re-validate ownership after slow removal.
           if (!claimHealthy || !this.ownsGcClaim(c.id, token)) {
             logger.warn(
               "GC claim lost during removal; not committing record deletion",
-              { id: c.id, path: c.entry.worktree_path },
+              { id: c.id, path: pre.entry.worktree_path },
             );
             continue;
           }
-          if (c.kind === "pending") succeededPending.add(c.entry.run_id);
-          else succeededSessions.add(c.id);
+          // Freshness gate #2 snapshot for commit-time compare.
+          if (c.kind === "pending") {
+            succeededPending.push({
+              id: c.id,
+              stamp: pre.stamp,
+              worktree_path: pre.entry.worktree_path,
+            });
+          } else {
+            succeededSessions.push({
+              id: c.id,
+              stamp: pre.stamp,
+              worktree_path: pre.entry.worktree_path,
+            });
+          }
         } catch (err) {
           logger.warn(
             c.kind === "pending"
@@ -380,16 +475,32 @@ export class SessionStore {
         }
       }
 
-      if (succeededPending.size === 0 && succeededSessions.size === 0) {
+      if (succeededPending.length === 0 && succeededSessions.length === 0) {
         return 0;
       }
 
       let removed = 0;
       await this.withLock((data) => {
-        if (succeededPending.size) {
+        if (succeededPending.length) {
+          const want = new Map(
+            succeededPending.map((s) => [s.id, s] as const),
+          );
           const nextPending: PendingWorktree[] = [];
           for (const p of data.pending_worktrees) {
-            if (succeededPending.has(p.run_id)) {
+            const exp = want.get(p.run_id);
+            if (!exp) {
+              nextPending.push(p);
+              continue;
+            }
+            // Commit only if still the same stale snapshot (not refreshed /
+            // remapped / replaced).
+            if (
+              p.created_at === exp.stamp &&
+              p.worktree_path === exp.worktree_path &&
+              !Number.isNaN(Date.parse(p.created_at)) &&
+              Date.parse(p.created_at) < cutoff &&
+              !this.isRunning(p.run_id)
+            ) {
               removed++;
               continue;
             }
@@ -398,10 +509,18 @@ export class SessionStore {
           data.pending_worktrees = nextPending;
         }
 
-        if (succeededSessions.size) {
-          for (const id of succeededSessions) {
-            if (data.sessions[id]) {
-              delete data.sessions[id];
+        if (succeededSessions.length) {
+          for (const exp of succeededSessions) {
+            const rec = data.sessions[exp.id];
+            if (!rec) continue;
+            if (
+              rec.last_used_at === exp.stamp &&
+              rec.worktree_path === exp.worktree_path &&
+              !Number.isNaN(Date.parse(rec.last_used_at)) &&
+              Date.parse(rec.last_used_at) < cutoff &&
+              !this.isRunning(exp.id)
+            ) {
+              delete data.sessions[exp.id];
               removed++;
             }
           }
@@ -416,6 +535,65 @@ export class SessionStore {
         clearInterval(claim.renew);
         this.releaseGcClaim(claim.id, claim.token);
       }
+    }
+  }
+
+  /**
+   * Re-read the live store record and confirm it is still a GC candidate.
+   * Returns the freshest entry + stamp on success.
+   */
+  private async revalidateGcCandidate(
+    c: {
+      kind: "pending" | "session";
+      id: string;
+      entry: PendingWorktree | SessionRecord;
+      stamp: string;
+    },
+    cutoff: number,
+  ): Promise<
+    | { ok: true; entry: PendingWorktree | SessionRecord; stamp: string }
+    | { ok: false }
+  > {
+    try {
+      return await this.withLock((data) => {
+        if (this.isRunning(c.id)) return { ok: false as const };
+
+        if (c.kind === "pending") {
+          const p = data.pending_worktrees.find((x) => x.run_id === c.id);
+          if (!p) return { ok: false as const };
+          // Path remapped / entry replaced — do not delete the new tree.
+          if (p.worktree_path !== c.entry.worktree_path) {
+            return { ok: false as const };
+          }
+          const t = Date.parse(p.created_at);
+          if (Number.isNaN(t) || t >= cutoff) return { ok: false as const };
+          return {
+            ok: true as const,
+            entry: { ...p },
+            stamp: p.created_at,
+          };
+        }
+
+        const rec = data.sessions[c.id];
+        if (!rec) return { ok: false as const };
+        if (rec.worktree_path !== c.entry.worktree_path) {
+          return { ok: false as const };
+        }
+        const t = Date.parse(rec.last_used_at);
+        if (Number.isNaN(t) || t >= cutoff) return { ok: false as const };
+        return {
+          ok: true as const,
+          entry: { ...rec },
+          stamp: rec.last_used_at,
+        };
+      });
+    } catch (err) {
+      // Fail closed: skip this candidate rather than risk deleting a live tree.
+      logger.warn("Failed to revalidate GC candidate; skipping", {
+        id: c.id,
+        err: String(err),
+      });
+      return { ok: false };
     }
   }
 
@@ -486,7 +664,15 @@ export class SessionStore {
     }
   }
 
-  private hasActiveLeaseLocked(id: string): boolean {
+  /**
+   * @param purgeDead When true, unlink non-live leases for this id. Only the
+   *   claim/markRunning paths may set this — pure isRunning probes must not
+   *   create a gap a heartbeat can fill with a reset hard-max clock.
+   */
+  private hasActiveLeaseLocked(
+    id: string,
+    opts: { purgeDead: boolean } = { purgeDead: false },
+  ): boolean {
     const prefix = `${this.coordinationKey(id)}.`;
     const now = Date.now();
     let names: string[] = [];
@@ -506,7 +692,7 @@ export class SessionStore {
         }
         if (this.leaseIsLive(lease, stat.mtimeMs, now)) {
           active = true;
-        } else {
+        } else if (opts.purgeDead) {
           fs.unlinkSync(lease);
         }
       } catch {
@@ -516,19 +702,52 @@ export class SessionStore {
     return active;
   }
 
+  /** Unlink every non-live lease file for `id`. Caller holds the coord lock. */
+  private purgeDeadLeasesLocked(id: string): void {
+    this.hasActiveLeaseLocked(id, { purgeDead: true });
+  }
+
+  /**
+   * True when some *other* owner holds a live lease for this id.
+   * Caller holds the coordination lock.
+   */
+  private hasForeignActiveLeaseLocked(id: string): boolean {
+    const prefix = `${this.coordinationKey(id)}.`;
+    const ownName = `${this.coordinationKey(id)}.${this.ownerId}.lease`;
+    const now = Date.now();
+    let names: string[] = [];
+    try {
+      names = fs.readdirSync(this.leaseDir);
+    } catch {
+      return false;
+    }
+    for (const name of names) {
+      if (!name.startsWith(prefix) || !name.endsWith(".lease")) continue;
+      if (name === ownName) continue;
+      const lease = path.join(this.leaseDir, name);
+      try {
+        const stat = fs.lstatSync(lease);
+        if (!stat.isFile() || stat.isSymbolicLink()) continue;
+        if (this.leaseIsLive(lease, stat.mtimeMs, now)) return true;
+      } catch {
+        /* disappeared */
+      }
+    }
+    return false;
+  }
+
   /**
    * Decide whether a lease file still protects an active run.
    *
-   * 1. Fresh heartbeat (mtime within soft TTL) → live. An actively heartbeating
-   *    process must never have its worktree collected mid-run.
-   * 2. Stale heartbeat + owner PID still alive + age ≤ hard max → live
-   *    (debugger / laptop suspend longer than soft TTL).
-   * 3. Stale heartbeat + dead PID, past hard max, or unparseable legacy lease
-   *    → collectible (crashed process cannot block GC forever; hard max also
-   *    bounds PID-reuse ambiguity for the PID-liveness extension only).
+   * 1. Fresh heartbeat (mtime within soft TTL) → live, regardless of
+   *    created_at. Active runs outlive maxTimeoutMs wall time by design.
+   * 2. Stale heartbeat + age past hard max → dead (bounds PID-liveness /
+   *    silent stuck owners; recreation must not reset created_at).
+   * 3. Stale heartbeat + owner PID still alive + under hard max → live.
+   * 4. Dead PID / unparseable legacy past soft TTL → collectible.
    */
   private leaseIsLive(leasePath: string, mtimeMs: number, now: number): boolean {
-    // Fresh mtime means this owner is still heartbeating — always protect.
+    // Fresh mtime means the owner is still heartbeating — always protect.
     if (now - mtimeMs <= LEASE_SOFT_TTL_MS) {
       return true;
     }
@@ -586,11 +805,17 @@ export class SessionStore {
     return null;
   }
 
+  /**
+   * Atomically purge dead leases and acquire a GC claim under the coordination
+   * lock. Live leases (including hard-max-still-protected ones) refuse the claim.
+   * Never leave a window where an expired lease is unlinked but no claim exists.
+   */
   private claimForGc(id: string): string | null {
     try {
       return this.withCoordinationLockSync(id, () => {
         if (this.readActiveClaimLocked(id)) return null;
-        if (this.hasActiveLeaseLocked(id)) return null;
+        // Purge + liveness check + claim write are one critical section.
+        if (this.hasActiveLeaseLocked(id, { purgeDead: true })) return null;
         const token = `${this.ownerId}-${crypto.randomUUID()}`;
         const claim: GcClaim = {
           owner: token,
