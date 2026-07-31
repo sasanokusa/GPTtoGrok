@@ -11,6 +11,8 @@ export interface GrokRunOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   maxStderrBytes: number;
+  /** Optional per-run override; otherwise the runner-wide limit is used. */
+  maxStdoutBytes?: number;
   /** Called when process is enqueued (for timeout-from-enqueue). */
   enqueuedAt?: number;
 }
@@ -23,6 +25,9 @@ export interface GrokRunOutcome {
   durationMs: number;
   timedOut: boolean;
   cancelled: boolean;
+  outputLimitExceeded: boolean;
+  stdoutBytes: number;
+  maxStdoutBytes: number;
 }
 
 interface QueueItem {
@@ -41,6 +46,8 @@ const ENV_SCRUB_KEYS = [
   "NPM_TOKEN",
 ];
 
+export const DEFAULT_MAX_GROK_STDOUT_BYTES = 16 * 1024 * 1024;
+
 export function scrubEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     HOME: base.HOME,
@@ -51,11 +58,9 @@ export function scrubEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessE
     LC_ALL: base.LC_ALL,
     TERM: "dumb",
     NO_COLOR: "1",
-    // Grok may need these for auth
     XDG_CONFIG_HOME: base.XDG_CONFIG_HOME,
     XDG_CACHE_HOME: base.XDG_CACHE_HOME,
   };
-  // Preserve Grok-related non-secret paths
   for (const [k, v] of Object.entries(base)) {
     if (!v) continue;
     if (k.startsWith("GROK_") && !/KEY|TOKEN|SECRET|PASSWORD/i.test(k)) {
@@ -145,12 +150,18 @@ export function buildGrokArgv(opts: {
 export class GrokRunner {
   private readonly maxConcurrent: number;
   private readonly maxQueue: number;
+  private readonly maxStdoutBytes: number;
   private active = 0;
   private readonly queue: QueueItem[] = [];
 
-  constructor(maxConcurrent = 2, maxQueue = 8) {
+  constructor(
+    maxConcurrent = 2,
+    maxQueue = 8,
+    maxStdoutBytes = DEFAULT_MAX_GROK_STDOUT_BYTES,
+  ) {
     this.maxConcurrent = maxConcurrent;
     this.maxQueue = maxQueue;
+    this.maxStdoutBytes = Math.max(1, maxStdoutBytes);
   }
 
   async run(opts: GrokRunOptions): Promise<GrokRunOutcome> {
@@ -213,9 +224,12 @@ export class GrokRunner {
     return new Promise((resolve, reject) => {
       const started = Date.now();
       const parser = new StreamingJsonParser();
+      const maxStdoutBytes = Math.max(1, opts.maxStdoutBytes ?? this.maxStdoutBytes);
+      let stdoutBytes = 0;
       let stderr = "";
       let timedOut = false;
       let cancelled = false;
+      let outputLimitExceeded = false;
       let settled = false;
       let child: ChildProcess;
 
@@ -260,10 +274,11 @@ export class GrokRunner {
       let killTimer: NodeJS.Timeout | undefined;
       let graceTimer: NodeJS.Timeout | undefined;
 
-      const beginCancel = (reason: "timeout" | "cancel") => {
+      const beginCancel = (reason: "timeout" | "cancel" | "output_limit") => {
         if (settled) return;
         if (reason === "timeout") timedOut = true;
-        else cancelled = true;
+        else if (reason === "cancel") cancelled = true;
+        else outputLimitExceeded = true;
         logger.info("Stopping Grok process group", { reason, pid: child.pid });
         killGroup("SIGTERM");
         graceTimer = setTimeout(() => {
@@ -280,7 +295,15 @@ export class GrokRunner {
       }
 
       child.stdout?.on("data", (chunk: Buffer) => {
-        parser.push(chunk.toString("utf8"));
+        if (outputLimitExceeded) return;
+        const remaining = maxStdoutBytes - stdoutBytes;
+        stdoutBytes += chunk.length;
+        if (remaining > 0) {
+          parser.push(chunk.subarray(0, Math.min(chunk.length, remaining)).toString("utf8"));
+        }
+        if (stdoutBytes > maxStdoutBytes) {
+          beginCancel("output_limit");
+        }
       });
       child.stderr?.on("data", (chunk: Buffer) => {
         stderr += chunk.toString("utf8");
@@ -321,6 +344,9 @@ export class GrokRunner {
           durationMs: Date.now() - started,
           timedOut,
           cancelled,
+          outputLimitExceeded,
+          stdoutBytes,
+          maxStdoutBytes,
         });
       });
 
@@ -334,7 +360,31 @@ export class GrokRunner {
 }
 
 export function mapRunOutcomeToError(outcome: GrokRunOutcome): GrokMcpError | null {
-  const { parse, exitCode, timedOut, cancelled, stderrTail } = outcome;
+  const {
+    parse,
+    exitCode,
+    timedOut,
+    cancelled,
+    outputLimitExceeded,
+    stdoutBytes,
+    maxStdoutBytes,
+    stderrTail,
+  } = outcome;
+  if (outputLimitExceeded) {
+    return new GrokMcpError(
+      "GROK_MCP_OUTPUT_TOO_LARGE",
+      `Grok stdout exceeded the ${maxStdoutBytes}-byte limit`,
+      {
+        exit_code: exitCode ?? undefined,
+        stderr_tail: stderrTail,
+        partial_summary: parse.text.slice(0, 4000),
+        session_id: parse.sessionId,
+        stdout_bytes: stdoutBytes,
+        max_stdout_bytes: maxStdoutBytes,
+        warnings: ["PARTIAL_RESULT", "OUTPUT_LIMIT_EXCEEDED"],
+      },
+    );
+  }
   if (timedOut) {
     return new GrokMcpError("GROK_MCP_TIMEOUT", "Grok run timed out", {
       exit_code: exitCode ?? undefined,
