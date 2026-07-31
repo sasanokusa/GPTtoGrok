@@ -166,18 +166,29 @@ function unquoteGitPath(token: string): string {
   return t;
 }
 
-/** Parse paths without splitting ordinary spaces inside Git's unquoted headers. */
+/**
+ * Parse paths from a `diff --git` header body (everything after `diff --git `).
+ *
+ * Git normally either quotes both sides or neither. Review gaps also cover
+ * mixed quoted/unquoted tokens. Fail closed (return []) when the header cannot
+ * be recovered unambiguously — callers treat that as an incomplete patch.
+ */
 function pathsFromDiffGitHeader(rest: string): string[] {
-  if (rest.startsWith('"')) {
+  const stripAb = (value: string): string => {
+    if (value.startsWith("a/") || value.startsWith("b/")) return value.slice(2);
+    return value;
+  };
+
+  // Any quote → quote-aware tokenization (covers fully quoted and mixed).
+  if (rest.includes('"')) {
     const parts = rest.match(/"(?:\\.|[^"])*"|[^\s]+/g) ?? [];
     if (parts.length !== 2) return [];
-    return parts.map((part) => {
-      let value = unquoteGitPath(part);
-      if (value.startsWith("a/") || value.startsWith("b/")) value = value.slice(2);
-      return value;
-    });
+    const paths = parts.map((part) => stripAb(unquoteGitPath(part)));
+    if (!paths[0] || !paths[1]) return [];
+    return paths;
   }
 
+  // Unquoted paths may contain ordinary spaces; split on the last " b/" only.
   if (!rest.startsWith("a/")) return [];
   const split = rest.lastIndexOf(" b/");
   if (split <= 2) return [];
@@ -212,17 +223,17 @@ export function filterSecretDiffHunks(
   const lines = diff.split("\n");
   const keptChunks: string[][] = [];
   let current: string[] | null = null;
-  let currentIsSecret = false;
+  /** Drop this hunk (secret path and/or unparseable header). */
+  let currentDrop = false;
   let redactedAny = false;
   let unparseableAny = false;
   let preamble: string[] = [];
 
   const flush = () => {
     if (current == null) return;
-    if (currentIsSecret) redactedAny = true;
-    else keptChunks.push(current);
+    if (!currentDrop) keptChunks.push(current);
     current = null;
-    currentIsSecret = false;
+    currentDrop = false;
   };
 
   for (const line of lines) {
@@ -232,10 +243,14 @@ export function filterSecretDiffHunks(
       preamble = [];
       const paths = pathsFromDiffHeaderLine(line);
       if (paths.length === 0) {
-        currentIsSecret = true;
+        // Fail closed: unparseable ≠ secret; do not raise REDACTED_SECRET_PATHS.
+        currentDrop = true;
         unparseableAny = true;
+      } else if (paths.some((p) => isSecretPath(p, cfg))) {
+        currentDrop = true;
+        redactedAny = true;
       } else {
-        currentIsSecret = paths.some((p) => isSecretPath(p, cfg));
+        currentDrop = false;
       }
       continue;
     }
@@ -247,7 +262,7 @@ export function filterSecretDiffHunks(
   }
   flush();
 
-  if (keptChunks.length === 0 && preamble.length && !redactedAny) {
+  if (keptChunks.length === 0 && preamble.length && !redactedAny && !unparseableAny) {
     return {
       diff: preamble.join("\n"),
       redactedAny: false,
@@ -396,6 +411,14 @@ export interface DiffAssembly {
   complete: boolean;
 }
 
+/**
+ * Collect the working-tree change as a single redacted patch.
+ *
+ * Tracked changes use one full `git diff HEAD` (with `--no-ext-diff` /
+ * `--no-textconv` / `--no-color`) and then filter secret-path hunks in memory.
+ * Pathspecs are deliberately not expanded into argv — a large tree can exceed
+ * ARG_MAX, and the design mandates full collection then filter.
+ */
 export async function assembleDiff(
   effectiveCwd: string,
   redactCfg: RedactConfig,
@@ -417,7 +440,17 @@ export async function assembleDiff(
     };
   }
 
-  const porcelain = await gitStatusPorcelain(gitRoot);
+  let porcelain: string;
+  try {
+    porcelain = await gitStatusPorcelain(gitRoot);
+  } catch {
+    return {
+      changedFiles: [],
+      diff: "",
+      warnings: ["DIFF_COLLECTION_FAILED"],
+      complete: false,
+    };
+  }
   const parsed = parsePorcelainPaths(porcelain);
   const { kept, redacted } = filterSecretPaths(parsed.all, redactCfg);
   if (redacted.length) {
@@ -427,28 +460,52 @@ export async function assembleDiff(
 
   const trackedKept = parsed.trackedChanged.filter((p) => kept.includes(p));
   const diffParts: string[] = [];
-  if (trackedKept.length > 0) {
-    const tracked = await runGit(
-      safeGitDiffArgs("HEAD", "--", ...trackedKept),
-      gitRoot,
-    );
-    if (tracked.stdout.trim()) {
-      const filtered = filterSecretDiffHunks(tracked.stdout, redactCfg);
-      if (filtered.redactedAny) {
-        warnings.push("REDACTED_SECRET_PATHS");
+
+  // Always collect the full tracked diff when porcelain reports any tracked
+  // change (including secrets — those are stripped in memory). Avoids ARG_MAX
+  // from per-path argv expansion and matches the design's "full then filter".
+  if (parsed.trackedChanged.length > 0) {
+    try {
+      const tracked = await runGit(safeGitDiffArgs("HEAD", "--"), gitRoot);
+      // git diff without --exit-code returns 0; nonzero is a real failure.
+      if (tracked.exitCode !== 0) {
+        warnings.push("TRACKED_DIFF_FAILED");
+        omitted = true;
+      } else if (tracked.stdout.trim()) {
+        const filtered = filterSecretDiffHunks(tracked.stdout, redactCfg);
+        if (filtered.redactedAny) {
+          warnings.push("REDACTED_SECRET_PATHS");
+          omitted = true;
+        }
+        if (filtered.unparseableAny) {
+          warnings.push("UNPARSEABLE_DIFF_HEADER");
+          omitted = true;
+        }
+        if (filteredDiffHasBinaryMarker(filtered.diff)) {
+          warnings.push("BINARY_SKIPPED");
+          omitted = true;
+        }
+        if (filtered.diff.trim()) {
+          diffParts.push(filtered.diff.replace(/\n?$/, "\n"));
+        } else if (
+          trackedKept.length > 0 &&
+          !filtered.redactedAny &&
+          !filtered.unparseableAny
+        ) {
+          // Non-secret tracked changes produced no usable patch (spawn/filter
+          // pathology, empty binary-only after drop, etc.). Unparseable drops
+          // already set UNPARSEABLE_DIFF_HEADER + omitted above.
+          warnings.push("TRACKED_DIFF_EMPTY");
+          omitted = true;
+        }
+      } else if (trackedKept.length > 0) {
+        // Porcelain reported non-secret tracked changes but git emitted nothing.
+        warnings.push("TRACKED_DIFF_EMPTY");
         omitted = true;
       }
-      if (filtered.unparseableAny) {
-        warnings.push("UNPARSEABLE_DIFF_HEADER");
-        omitted = true;
-      }
-      if (filteredDiffHasBinaryMarker(filtered.diff)) {
-        warnings.push("BINARY_SKIPPED");
-        omitted = true;
-      }
-      if (filtered.diff.trim()) {
-        diffParts.push(filtered.diff.replace(/\n?$/, "\n"));
-      }
+    } catch {
+      warnings.push("TRACKED_DIFF_FAILED");
+      omitted = true;
     }
   }
 
@@ -462,7 +519,13 @@ export async function assembleDiff(
     const abs = path.join(gitRoot, rel);
     try {
       const st = await fs.stat(abs);
-      if (!st.isFile()) continue;
+      if (!st.isFile()) {
+        // Status listed a non-file (dir/socket/device). Never claim completeness
+        // for a changed path we cannot represent as a patch.
+        warnings.push("UNTRACKED_NON_FILE_SKIPPED");
+        omitted = true;
+        continue;
+      }
       if (st.size > opts.maxUntrackedFileBytes) {
         warnings.push("UNTRACKED_TOO_LARGE");
         omitted = true;
@@ -475,6 +538,8 @@ export async function assembleDiff(
         continue;
       }
       if (isSecretPath(rel, redactCfg)) {
+        // Defense in depth: secrets should already be absent from `kept`.
+        warnings.push("REDACTED_SECRET_PATHS");
         omitted = true;
         continue;
       }
@@ -483,8 +548,13 @@ export async function assembleDiff(
         safeGitDiffArgs("--no-index", "--", "/dev/null", rel),
         gitRoot,
       );
+      // git --no-index exits 1 when files differ (expected success).
       if (patch.stdout.trim()) {
         diffParts.push(normalizeNewFilePatch(patch.stdout, rel).replace(/\n?$/, "\n"));
+      } else {
+        // Known readable non-secret untracked file produced no usable patch.
+        warnings.push("UNTRACKED_DIFF_FAILED");
+        omitted = true;
       }
     } catch {
       warnings.push("UNTRACKED_DIFF_FAILED");
@@ -508,54 +578,138 @@ export async function assembleDiff(
   };
 }
 
+export interface DiffVsRefResult {
+  stat: string;
+  diff: string;
+  empty: boolean;
+  /** True when the returned patch/stat honestly represent every non-secret change. */
+  complete: boolean;
+  warnings: string[];
+}
+
+/**
+ * Diff vs a verified base ref for review injection.
+ *
+ * Collects the full safe git diff/stat (no per-path argv expansion) and filters
+ * secret-path hunks/rows in memory. Collection/filtering omissions are reported
+ * via `complete: false` + `warnings` so callers never present a silently partial
+ * review diff as complete.
+ */
 export async function getDiffVsRef(
   cwd: string,
   baseRef: string,
   maxBytes: number,
   redactCfg: RedactConfig,
-): Promise<{ stat: string; diff: string; empty: boolean }> {
+): Promise<DiffVsRefResult> {
   const root = await getRepoRoot(cwd);
   const verified = await verifyBaseRef(root, baseRef);
+  const warnings: string[] = [];
+  let complete = true;
 
-  const nameR = await runGit(
-    safeGitDiffArgs("--name-only", "-z", verified, "--"),
-    root,
-  );
+  let nameR: RunGitResult;
+  let statR: RunGitResult;
+  let diffR: RunGitResult;
+  try {
+    // Full collection — never expand path lists into argv (ARG_MAX).
+    [nameR, statR, diffR] = await Promise.all([
+      runGit(safeGitDiffArgs("--name-only", "-z", verified, "--"), root),
+      runGit(safeGitDiffArgs("--stat", verified, "--"), root),
+      runGit(safeGitDiffArgs(verified, "--"), root),
+    ]);
+  } catch (err) {
+    throw new GrokMcpError(
+      "GROK_MCP_INTERNAL",
+      `Failed to collect git diff vs ${baseRef}: ${String(err)}`,
+      { warnings: ["DIFF_COLLECTION_FAILED"] },
+    );
+  }
+
+  if (nameR.exitCode !== 0 || statR.exitCode !== 0 || diffR.exitCode !== 0) {
+    throw new GrokMcpError(
+      "GROK_MCP_INTERNAL",
+      `git diff vs ${baseRef} failed`,
+      {
+        stderr_tail: [nameR.stderr, statR.stderr, diffR.stderr]
+          .filter(Boolean)
+          .join("\n")
+          .slice(-500),
+        warnings: ["DIFF_COLLECTION_FAILED"],
+      },
+    );
+  }
+
   const names = nameR.stdout.split("\0").filter(Boolean);
   const { kept, redacted } = filterSecretPaths(names, redactCfg);
+  if (redacted.length) {
+    warnings.push("REDACTED_SECRET_PATHS");
+    complete = false;
+  }
+
+  if (names.length === 0) {
+    return { stat: "", diff: "", empty: true, complete: true, warnings: [] };
+  }
 
   if (kept.length === 0) {
-    return { stat: "", diff: "", empty: true };
+    // Every changed path was secret — honest empty, incomplete.
+    return {
+      stat: "",
+      diff: "",
+      empty: true,
+      complete: false,
+      warnings: [...new Set(warnings)],
+    };
   }
 
-  const statR = await runGit(
-    safeGitDiffArgs("--stat", verified, "--", ...kept),
-    root,
-  );
-  const diffR = await runGit(
-    safeGitDiffArgs(verified, "--", ...kept),
-    root,
-  );
+  const filteredStat = filterSecretStatLines(statR.stdout || "", redactCfg);
+  const filteredDiff = filterSecretDiffHunks(diffR.stdout || "", redactCfg);
 
-  const filteredStat = filterSecretStatLines(statR.stdout || "", redactCfg).stat;
-  const filteredDiff = filterSecretDiffHunks(diffR.stdout || "", redactCfg).diff;
-
-  if (redacted.length) {
-    // already omitted via pathspecs; keep empty marker free of secret names
+  if (filteredStat.redactedAny || filteredDiff.redactedAny) {
+    warnings.push("REDACTED_SECRET_PATHS");
+    complete = false;
+  }
+  if (filteredDiff.unparseableAny) {
+    warnings.push("UNPARSEABLE_DIFF_HEADER");
+    complete = false;
+  }
+  if (filteredDiffHasBinaryMarker(filteredDiff.diff)) {
+    warnings.push("BINARY_SKIPPED");
+    complete = false;
   }
 
-  let diff = redactText(filteredDiff);
+  // Non-secret names existed but filtering left nothing usable.
+  if (
+    !filteredDiff.diff.trim() &&
+    kept.length > 0 &&
+    !filteredDiff.redactedAny &&
+    !filteredDiff.unparseableAny
+  ) {
+    warnings.push("DIFF_FILTER_EMPTY");
+    complete = false;
+  }
+
+  const flagged = redactTextWithFlag(filteredDiff.diff);
+  let diff = flagged.text;
+  if (flagged.redacted) {
+    warnings.push("REDACTED_SECRET_CONTENT");
+    complete = false;
+  }
+
   if (Buffer.byteLength(diff, "utf8") > maxBytes) {
     let truncated = diff;
     while (Buffer.byteLength(truncated, "utf8") > maxBytes - 40 && truncated.length) {
       truncated = truncated.slice(0, Math.floor(truncated.length * 0.9));
     }
     diff = `${truncated}\n... [diff truncated]`;
+    warnings.push("DIFF_TRUNCATED");
+    complete = false;
   }
+
   return {
-    stat: redactText(filteredStat),
+    stat: redactText(filteredStat.stat),
     diff,
-    empty: !filteredDiff.trim(),
+    empty: !diff.trim(),
+    complete,
+    warnings: [...new Set(warnings)],
   };
 }
 

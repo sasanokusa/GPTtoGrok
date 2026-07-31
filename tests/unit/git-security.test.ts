@@ -88,6 +88,75 @@ describe("secret path filtering with spaces", () => {
     expect(filtered.diff).toBe("");
   });
 
+  it("parses fully quoted diff headers", () => {
+    const diff = [
+      `diff --git "a/dir with space/.env" "b/dir with space/.env"`,
+      "index 1111111..2222222 100644",
+      `--- "a/dir with space/.env"`,
+      `+++ "b/dir with space/.env"`,
+      "@@ -1 +1 @@",
+      "-TOKEN=before",
+      "+TOKEN=after",
+      "",
+    ].join("\n");
+
+    const filtered = filterSecretDiffHunks(diff, secretCfg);
+    expect(filtered.redactedAny).toBe(true);
+    expect(filtered.unparseableAny).toBe(false);
+    expect(filtered.diff).toBe("");
+  });
+
+  it("parses mixed quoted/unquoted diff --git headers", () => {
+    // Abnormal but observed in review: one side quoted, one not.
+    const secretMixed = [
+      `diff --git a/plain/.env "b/dir with space/.env"`,
+      "index 1111111..2222222 100644",
+      "--- a/plain/.env",
+      `+++ "b/dir with space/.env"`,
+      "@@ -1 +1 @@",
+      "-TOKEN=before",
+      "+TOKEN=after",
+      "",
+    ].join("\n");
+    const secretFiltered = filterSecretDiffHunks(secretMixed, secretCfg);
+    expect(secretFiltered.redactedAny).toBe(true);
+    expect(secretFiltered.unparseableAny).toBe(false);
+    expect(secretFiltered.diff).toBe("");
+
+    const okMixed = [
+      `diff --git a/plain.ts "b/dir with space/app.ts"`,
+      "index 1111111..2222222 100644",
+      "--- a/plain.ts",
+      `+++ "b/dir with space/app.ts"`,
+      "@@ -1 +1 @@",
+      "-export const n = 1;",
+      "+export const n = 2;",
+      "",
+    ].join("\n");
+    const okFiltered = filterSecretDiffHunks(okMixed, secretCfg);
+    expect(okFiltered.redactedAny).toBe(false);
+    expect(okFiltered.unparseableAny).toBe(false);
+    expect(okFiltered.diff).toContain("export const n = 2");
+  });
+
+  it("fail-closes unparseable headers as incomplete omissions", () => {
+    const diff = [
+      "diff --git totally-broken-header",
+      "index 1111111..2222222 100644",
+      "--- a/x",
+      "+++ b/x",
+      "@@ -1 +1 @@",
+      "-a",
+      "+b",
+      "",
+    ].join("\n");
+    const filtered = filterSecretDiffHunks(diff, secretCfg);
+    expect(filtered.unparseableAny).toBe(true);
+    // Unparseable is not a secret-path redaction.
+    expect(filtered.redactedAny).toBe(false);
+    expect(filtered.diff).toBe("");
+  });
+
   it("omits a tracked .env below a directory whose name contains spaces", async () => {
     const repo = initRepo();
     const nested = path.join(repo, "dir with space");

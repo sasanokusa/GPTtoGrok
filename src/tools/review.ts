@@ -45,9 +45,19 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
                 aggressive: ctx.config.secretGlobsAggressive,
               },
             );
+            if (d.warnings.length) {
+              extraWarnings.push(...d.warnings);
+            }
+            if (!d.complete) {
+              // Never present a silently partial review patch as complete.
+              extraWarnings.push("DIFF_INCOMPLETE");
+            }
+            const completenessNote = d.complete
+              ? ""
+              : "\n(note: injected diff is incomplete; see warnings — do not treat as full change set)";
             const body = d.empty
-              ? `(no diff vs ${baseRef})`
-              : `### stat\n${d.stat}\n\n### diff\n${d.diff}`;
+              ? `(no diff vs ${baseRef}${d.complete ? "" : "; collection/filtering omitted changes"})`
+              : `### stat\n${d.stat}\n\n### diff\n${d.diff}${completenessNote}`;
             prompt = `${input.prompt}\n\n## Diff vs ${baseRef} (server-injected, may be truncated)\n${body}`;
           } catch (err) {
             if (shouldRethrowReviewDiffError(err)) {
@@ -58,6 +68,11 @@ export function registerReview(server: McpServer, ctx: ToolContext): void {
             });
             prompt = `${input.prompt}\n\n## Diff vs base_ref\n(failed to collect git diff; review from prompt context only)`;
             extraWarnings.push("DIFF_UNAVAILABLE");
+            if (isGrokMcpError(err) && err.details?.warnings) {
+              for (const w of err.details.warnings) {
+                if (typeof w === "string") extraWarnings.push(w);
+              }
+            }
           }
         }
 

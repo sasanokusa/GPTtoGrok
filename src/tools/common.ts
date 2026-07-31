@@ -812,14 +812,20 @@ export async function runTool(
       }
     }
 
-    // Map errors — but allow partial success with diff
+    // Map errors — allow partial success with useful text/diff for ordinary
+    // nonzero exits, but never soft-degrade hard failures (cancel, timeout,
+    // or stdout over the configured limit). GROK_MCP_OUTPUT_TOO_LARGE must
+    // always reach the MCP caller as a structured hard error, even when a
+    // partial summary or partial worktree diff already exists.
     const mapped = mapRunOutcomeToError(outcome);
     if (mapped) {
       const hasUseful =
         Boolean(diffAsm.diff.trim()) || Boolean(parse.text.trim());
-      const isCancel =
-        mapped.code === "GROK_MCP_CANCELLED" || mapped.code === "GROK_MCP_TIMEOUT";
-      if (isCancel || !hasUseful) {
+      const isHardError =
+        mapped.code === "GROK_MCP_CANCELLED" ||
+        mapped.code === "GROK_MCP_TIMEOUT" ||
+        mapped.code === "GROK_MCP_OUTPUT_TOO_LARGE";
+      if (isHardError || !hasUseful) {
         throw new GrokMcpError(mapped.code, mapped.message, {
           ...mapped.details,
           worktree_path: worktreePath,

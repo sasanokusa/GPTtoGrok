@@ -53,7 +53,9 @@ export function createServer(config: ServerConfig): McpServer {
     config.maxQueue,
     config.maxStdoutBytes,
   );
-  const store = new SessionStore(config.sessionStorePath, config.maxSessions);
+  const store = new SessionStore(config.sessionStorePath, config.maxSessions, {
+    maxTimeoutMs: config.maxTimeoutMs,
+  });
 
   registerAllTools(server, { config, runner, store });
 

@@ -18,16 +18,60 @@ const LOCK_HEARTBEAT_MS = 2_000;
 // Cross-process leases protect active sessions/runs from another MCP process's
 // startup GC. Lease files are deliberately separate from sessions.json so a
 // heartbeat never rewrites the whole store.
-const LEASE_TTL_MS = 5 * 60_000;
-const LEASE_HEARTBEAT_MS = 10_000;
-const GC_CLAIM_TTL_MS = 15 * 60_000;
+//
+// Soft TTL (mtime): a fresh heartbeat always counts as live.
+// Hard max: even a live PID cannot block GC past max tool duration + grace —
+// covers crashed hosts and PID reuse without leaving worktrees uncollectible.
+// PID liveness: a process suspended longer than the soft TTL still holds the
+// lease while its OS process is alive and under the hard max.
+/** Soft lease freshness window based on mtime/heartbeat. Exported for tests. */
+export const LEASE_SOFT_TTL_MS = 5 * 60_000;
+/** @deprecated Use LEASE_SOFT_TTL_MS. Kept for older test imports. */
+export const LEASE_TTL_MS = LEASE_SOFT_TTL_MS;
+export const LEASE_HEARTBEAT_MS = 10_000;
+/** Extra grace beyond max tool duration before a live-PID lease is reaped. */
+export const LEASE_HARD_GRACE_MS = 5 * 60_000;
+/** Default hard max when caller does not pass maxTimeoutMs (matches config). */
+export const DEFAULT_LEASE_HARD_MAX_MS = 3_600_000 + LEASE_HARD_GRACE_MS;
+export const GC_CLAIM_TTL_MS = 15 * 60_000;
+export const GC_CLAIM_RENEW_MS = 60_000;
 const COORD_LOCK_STALE_MS = 30_000;
 const COORD_LOCK_WAIT_MS = 2_000;
 const SYNC_WAIT = new Int32Array(new SharedArrayBuffer(4));
 
+interface LeaseRecord {
+  owner: string;
+  pid: number;
+  created_at: number;
+}
+
 interface GcClaim {
   owner: string;
   expires_at: number;
+}
+
+export interface SessionStoreOptions {
+  /**
+   * Maximum tool duration this process may run (ms). Bounds the PID-liveness
+   * extension when heartbeats go stale: `maxTimeoutMs + LEASE_HARD_GRACE_MS`.
+   * Fresh heartbeats always protect the run; hard max only limits how long a
+   * silent-but-alive PID can block GC after soft TTL (covers crash + PID reuse).
+   */
+  maxTimeoutMs?: number;
+}
+
+/** True when `pid` is a live process we can observe (best-effort, Unix). */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // EPERM: process exists but we cannot signal it — treat as alive.
+    if (code === "EPERM") return true;
+    return false;
+  }
 }
 
 export class SessionStore {
@@ -36,15 +80,26 @@ export class SessionStore {
   private readonly leaseDir: string;
   private readonly ownerId: string;
   private readonly maxSessions: number;
+  /** Hard ceiling for lease age even when the owner PID is still alive. */
+  private readonly leaseHardMaxMs: number;
   private readonly runningCounts = new Map<string, number>();
   private readonly leaseHeartbeats = new Map<string, NodeJS.Timeout>();
 
-  constructor(filePath: string, maxSessions = 500) {
+  constructor(
+    filePath: string,
+    maxSessions = 500,
+    options: SessionStoreOptions = {},
+  ) {
     this.filePath = filePath;
     this.lockPath = `${filePath}.lock`;
     this.leaseDir = `${filePath}.leases`;
     this.ownerId = `${process.pid}-${crypto.randomUUID()}`;
     this.maxSessions = maxSessions;
+    const maxTimeoutMs = options.maxTimeoutMs ?? 3_600_000;
+    this.leaseHardMaxMs = Math.max(
+      LEASE_SOFT_TTL_MS,
+      maxTimeoutMs + LEASE_HARD_GRACE_MS,
+    );
   }
 
   markRunning(sessionOrRunId: string): void {
@@ -63,22 +118,12 @@ export class SessionStore {
           { session_id: sessionOrRunId },
         );
       }
-      fs.writeFileSync(
-        this.leasePath(sessionOrRunId),
-        JSON.stringify({ owner: this.ownerId, created_at: Date.now() }),
-        { encoding: "utf8", mode: 0o600 },
-      );
+      this.writeLeaseLocked(sessionOrRunId);
     });
 
     this.runningCounts.set(sessionOrRunId, 1);
     const heartbeat = setInterval(() => {
-      try {
-        const now = new Date();
-        fs.utimesSync(this.leasePath(sessionOrRunId), now, now);
-      } catch {
-        // A stale lease may have been reaped after a very long process pause.
-        // Never recreate it blindly: a GC claim may now own the identifier.
-      }
+      this.renewLeaseHeartbeat(sessionOrRunId);
     }, LEASE_HEARTBEAT_MS);
     if (typeof heartbeat.unref === "function") heartbeat.unref();
     this.leaseHeartbeats.set(sessionOrRunId, heartbeat);
@@ -104,7 +149,8 @@ export class SessionStore {
         }
       });
     } catch (err) {
-      // A leaked lease expires by TTL; cleanup must not mask the tool result.
+      // A leaked lease expires by hard-max / dead-PID check; cleanup must not
+      // mask the tool result.
       logger.warn("Failed to release session lease", {
         id: sessionOrRunId,
         err: String(err),
@@ -126,6 +172,59 @@ export class SessionStore {
       });
       return true;
     }
+  }
+
+  /**
+   * Refresh lease mtime; on failure (e.g. lease reaped during a long suspend)
+   * recreate the lease only while this process still holds the running count
+   * and no foreign GC claim owns the id. Heartbeat failures must not silently
+   * make an active worktree collectible.
+   */
+  private renewLeaseHeartbeat(sessionOrRunId: string): void {
+    if ((this.runningCounts.get(sessionOrRunId) ?? 0) <= 0) return;
+    const lease = this.leasePath(sessionOrRunId);
+    try {
+      const now = new Date();
+      fs.utimesSync(lease, now, now);
+      return;
+    } catch {
+      /* fall through to recreate */
+    }
+
+    try {
+      this.withCoordinationLockSync(sessionOrRunId, () => {
+        if ((this.runningCounts.get(sessionOrRunId) ?? 0) <= 0) return;
+        if (this.readActiveClaimLocked(sessionOrRunId)) {
+          logger.warn(
+            "Lease heartbeat lost and GC claim owns id; cannot recreate",
+            { id: sessionOrRunId },
+          );
+          return;
+        }
+        // Recreate even if another stale lease file for this owner disappeared.
+        this.writeLeaseLocked(sessionOrRunId);
+        logger.warn("Recreated session lease after heartbeat failure", {
+          id: sessionOrRunId,
+        });
+      });
+    } catch (err) {
+      logger.warn("Failed to renew session lease heartbeat", {
+        id: sessionOrRunId,
+        err: String(err),
+      });
+    }
+  }
+
+  private writeLeaseLocked(sessionOrRunId: string): void {
+    const record: LeaseRecord = {
+      owner: this.ownerId,
+      pid: process.pid,
+      created_at: Date.now(),
+    };
+    fs.writeFileSync(this.leasePath(sessionOrRunId), JSON.stringify(record), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
   }
 
   async withLock<T>(fn: (data: SessionStoreData) => Promise<T> | T): Promise<T> {
@@ -226,13 +325,22 @@ export class SessionStore {
 
     const succeededPending = new Set<string>();
     const succeededSessions = new Set<string>();
-    const claims: Array<{ id: string; token: string }> = [];
+    const claims: Array<{ id: string; token: string; renew: NodeJS.Timeout }> =
+      [];
 
     try {
       for (const c of candidates) {
         const token = this.claimForGc(c.id);
         if (!token) continue;
-        claims.push({ id: c.id, token });
+        // Renew claim expiry for the whole removal — long `rm -rf` / network
+        // FS must not let the claim expire mid-flight. Fail-closed: if renewal
+        // loses exclusivity, do not commit the persistent-record deletion.
+        let claimHealthy = true;
+        const renew = setInterval(() => {
+          if (!this.renewGcClaim(c.id, token)) claimHealthy = false;
+        }, GC_CLAIM_RENEW_MS);
+        if (typeof renew.unref === "function") renew.unref();
+        claims.push({ id: c.id, token, renew });
 
         try {
           const result =
@@ -244,6 +352,16 @@ export class SessionStore {
               id: c.id,
               path: c.entry.worktree_path,
             });
+            continue;
+          }
+          // Re-validate ownership after slow removal. A lost/expired claim means
+          // another process may have claimed the id — leave the store record so
+          // GC can retry rather than silently dropping bookkeeping.
+          if (!claimHealthy || !this.ownsGcClaim(c.id, token)) {
+            logger.warn(
+              "GC claim lost during removal; not committing record deletion",
+              { id: c.id, path: c.entry.worktree_path },
+            );
             continue;
           }
           if (c.kind === "pending") succeededPending.add(c.entry.run_id);
@@ -295,6 +413,7 @@ export class SessionStore {
       return removed;
     } finally {
       for (const claim of claims) {
+        clearInterval(claim.renew);
         this.releaseGcClaim(claim.id, claim.token);
       }
     }
@@ -385,7 +504,7 @@ export class SessionStore {
         if (!stat.isFile() || stat.isSymbolicLink()) {
           continue;
         }
-        if (now - stat.mtimeMs <= LEASE_TTL_MS) {
+        if (this.leaseIsLive(lease, stat.mtimeMs, now)) {
           active = true;
         } else {
           fs.unlinkSync(lease);
@@ -395,6 +514,50 @@ export class SessionStore {
       }
     }
     return active;
+  }
+
+  /**
+   * Decide whether a lease file still protects an active run.
+   *
+   * 1. Fresh heartbeat (mtime within soft TTL) → live. An actively heartbeating
+   *    process must never have its worktree collected mid-run.
+   * 2. Stale heartbeat + owner PID still alive + age ≤ hard max → live
+   *    (debugger / laptop suspend longer than soft TTL).
+   * 3. Stale heartbeat + dead PID, past hard max, or unparseable legacy lease
+   *    → collectible (crashed process cannot block GC forever; hard max also
+   *    bounds PID-reuse ambiguity for the PID-liveness extension only).
+   */
+  private leaseIsLive(leasePath: string, mtimeMs: number, now: number): boolean {
+    // Fresh mtime means this owner is still heartbeating — always protect.
+    if (now - mtimeMs <= LEASE_SOFT_TTL_MS) {
+      return true;
+    }
+
+    let record: LeaseRecord | null = null;
+    try {
+      const raw = JSON.parse(fs.readFileSync(leasePath, "utf8")) as Partial<LeaseRecord>;
+      if (
+        typeof raw.owner === "string" &&
+        typeof raw.pid === "number" &&
+        typeof raw.created_at === "number"
+      ) {
+        record = raw as LeaseRecord;
+      }
+    } catch {
+      record = null;
+    }
+
+    if (!record) {
+      // Unparseable / legacy lease past soft TTL → fail open for GC.
+      return false;
+    }
+
+    // PID-liveness is only an extension beyond soft TTL; hard max bounds it.
+    if (now - record.created_at > this.leaseHardMaxMs) {
+      return false;
+    }
+
+    return isProcessAlive(record.pid);
   }
 
   private readActiveClaimLocked(id: string): GcClaim | null {
@@ -446,6 +609,52 @@ export class SessionStore {
         err: String(err),
       });
       return null;
+    }
+  }
+
+  /**
+   * Extend a live GC claim so long removals cannot lose exclusivity.
+   * @returns true when this token still owns a live claim after renewal.
+   */
+  private renewGcClaim(id: string, token: string): boolean {
+    try {
+      return this.withCoordinationLockSync(id, () => {
+        const claimPath = this.claimPath(id);
+        try {
+          const stat = fs.lstatSync(claimPath);
+          if (!stat.isFile() || stat.isSymbolicLink()) return false;
+          const claim = JSON.parse(fs.readFileSync(claimPath, "utf8")) as GcClaim;
+          if (claim.owner !== token) return false;
+          claim.expires_at = Date.now() + GC_CLAIM_TTL_MS;
+          fs.writeFileSync(claimPath, JSON.stringify(claim), {
+            encoding: "utf8",
+            mode: 0o600,
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      });
+    } catch (err) {
+      logger.warn("Failed to renew GC claim", { id, err: String(err) });
+      return false;
+    }
+  }
+
+  /** True when `token` currently owns a non-expired GC claim for `id`. */
+  private ownsGcClaim(id: string, token: string): boolean {
+    try {
+      return this.withCoordinationLockSync(id, () => {
+        const claim = this.readActiveClaimLocked(id);
+        return Boolean(claim && claim.owner === token);
+      });
+    } catch (err) {
+      // Fail closed: uncertainty must not commit a store-record deletion.
+      logger.warn("Failed to verify GC claim ownership", {
+        id,
+        err: String(err),
+      });
+      return false;
     }
   }
 
